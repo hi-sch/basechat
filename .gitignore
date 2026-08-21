@@ -1,0 +1,41 @@
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.movedfiles
+xcuserdata
+
+# Swift
+*.swiftlint
+
+# Derived Data
+build/
+DerivedData/
+
+# Pods
+Pods/
+
+# Fastlane
+fastlane/report.xml
+fastlane/test_frameworks
+
+# Simulator
+*.simxcache
+
+# Other
+*.suo
+*.sln
+*.sln.docstates
+*.scc
+*.sccblock
+*.scccache
+*.sccleak
+*.cache
+*.db
+*.xcbuildhistory
+
+# build dirs
+.build
+dist
