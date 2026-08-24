@@ -68,6 +68,46 @@ final class ChatStore {
         chats[i].updated = Date()
     }
 
+    /// Drops every turn after `messageID` — the first half of "regenerate from here".
+    /// Returns the history the model should see, i.e. everything up to and including it.
+    @discardableResult
+    func truncate(_ id: Chat.ID, after messageID: Message.ID) -> [Message] {
+        guard let i = chats.firstIndex(where: { $0.id == id }),
+              let j = chats[i].messages.firstIndex(where: { $0.id == messageID })
+        else { return [] }
+        chats[i].messages.removeSubrange((j + 1)...)
+        chats[i].updated = Date()
+        save()
+        return chats[i].messages
+    }
+
+    // MARK: Annotations
+
+    func annotations(in id: Chat.ID?) -> [Annotation] {
+        guard let id, let chat = chats.first(where: { $0.id == id }) else { return [] }
+        return chat.annotations
+    }
+
+    func add(_ annotation: Annotation, to id: Chat.ID) {
+        guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
+        chats[i].annotations.append(annotation)
+        save()
+    }
+
+    func update(_ annotation: Annotation, in id: Chat.ID) {
+        guard let i = chats.firstIndex(where: { $0.id == id }),
+              let j = chats[i].annotations.firstIndex(where: { $0.id == annotation.id })
+        else { return }
+        chats[i].annotations[j] = annotation
+        save()
+    }
+
+    func removeAnnotation(_ annotationID: Annotation.ID, in id: Chat.ID) {
+        guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
+        chats[i].annotations.removeAll { $0.id == annotationID }
+        save()
+    }
+
     private static func title(from text: String) -> String {
         let line = text.split(separator: "\n").first.map(String.init) ?? text
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -76,7 +116,28 @@ final class ChatStore {
 
     // MARK: Persistence
 
+    private var pendingWrite: Task<Void, Never>?
+
+    /// Coalesced: a save encodes every chat, and the callers are appends and
+    /// markup edits that arrive in bursts. Anything that must not be lost calls
+    /// `flush` instead.
     func save() {
+        pendingWrite?.cancel()
+        pendingWrite = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            self?.write()
+        }
+    }
+
+    /// Writes now and cancels any pending save — for app termination.
+    func flush() {
+        pendingWrite?.cancel()
+        pendingWrite = nil
+        write()
+    }
+
+    private func write() {
         guard let data = try? JSONEncoder().encode(chats) else { return }
         try? data.write(to: url, options: .atomic)
     }

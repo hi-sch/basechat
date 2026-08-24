@@ -15,7 +15,6 @@ final class Runtime {
         case failed(String)
 
         var isReady: Bool { if case .ready = self { return true }; return false }
-        var isBusy: Bool { if case .launching = self { return true }; return false }
     }
 
     var status: Status = .locating
@@ -44,7 +43,6 @@ final class Runtime {
 
     var apiURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
     var apiToken: String { apiKey }
-    var binaryPath: String { binURL?.path ?? "not found" }
 
     init() {
         selectedModel = UserDefaults.standard.string(forKey: "selectedModel")

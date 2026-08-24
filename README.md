@@ -1,22 +1,62 @@
 # BaseChat
 
-A minimal SwiftUI chat app for [BaseRT](https://basecompute.co), in the spirit of Notes:
-a sidebar of chats, a transcript, a composer.
+A SwiftUI chat app for [BaseRT](https://basecompute.co), in the spirit of Notes and Preview:
+a sidebar of chats, a transcript laid out as pages, and a composer. Models run locally through
+the `basert` CLI — nothing leaves the machine.
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/hi-sch/basechat/refs/heads/main/BaseChat.png" width="96%" alt="BaseChat Screenshot">
 </p>
 
 
+## What it does
+
+**The transcript is a document.** Turns are paginated onto US Letter sheets with a printable
+margin, fitted to the window width. A turn taller than one sheet flows across sheets rather than
+being clipped. Measured heights are shared between the screen and the exporter, so both break in
+the same places. There is a continuous, non-paginated mode in the ⋯ menu.
+
+**Dictation.** `AVAudioEngine` taps the microphone, buffers are resampled into the format
+`SpeechAnalyzer` asks for and pushed through an `AsyncStream` to a `SpeechTranscriber` with
+volatile results, so partial text lands in the composer as it is spoken. The on-device model is
+downloaded on first use, with progress shown above the composer.
+
+**Markup, the way Preview does it.** Highlight, underline and strike-through behave as text
+selections: a drag produces one band per line, snapped to the measured ink of the glyphs, so a
+band covers the letters and nothing else — no colour past the last word or above the tallest
+letter. They can be recoloured and deleted, not dragged. Shapes, notes and freehand sketches are
+objects: select, move, resize from any corner (hold ⇧ to keep proportions), and restyle from an
+inline inspector — any border and fill colour, opacity included, through the system colour panel.
+
+**PDF export.** Each sheet is drawn into a `CGPDFContext`, so the output is vector with selectable
+text. Notes become real PDF text annotations, so they open as notes rather than as a picture of
+one.
+
+**Open in Pages.** Any answer can be handed to Apple Pages as a styled RTF document — headings,
+lists, quotes and code arrive already formatted.
+
+**Search.** Scoped to all chats or the current one. The sidebar becomes a result list with match
+counts and snippets, and every hit in the transcript takes a yellow wash.
+
+**Per-turn metadata.** Each turn carries a timestamp; answers carry the id of the model that wrote
+them, so switching models mid-chat leaves the older answers labelled correctly. Regenerate rewinds
+to a prompt and asks again from there.
+
+
 ## Requirements
 
 - macOS 26+, Xcode 26+
 - The `basert` CLI installed (auto-detected at `~/.basert/basert`, `/opt/homebrew/bin/basert`, or `/usr/local/bin/basert`)
+- Dictation asks for microphone and speech recognition access on first use. Under the hardened
+  runtime this also needs the `com.apple.security.device.audio-input` entitlement, which is in
+  `BaseChat.entitlements`.
+- "Open in Pages" uses Apple Pages when it is installed, and otherwise hands the RTF to whichever
+  app owns the type.
 
 ## Run
 
 A built app is in `dist/BaseChat.app` — double-click it, or drag it to `/Applications`.
-`BaseChat-0.1.dmg` is the distributable: a 640×400 install window with the app, an Applications
+`BaseChat-0.2.dmg` is the distributable: a 640×400 install window with the app, an Applications
 alias, and an arrow between them.
 
 ## Packaging
@@ -68,10 +108,32 @@ codesign --force --deep --sign - dist/BaseChat.app
 | --- | --- |
 | ⌘N | New chat |
 | ⌘↩ | Send |
+| ⌘F | Search |
+| ⎋ | Close search, or put the armed markup tool away |
 | ⌘B | Bold |
 | ⌘I | Italic |
+| ⇧ while resizing | Keep a shape's proportions |
+| ⌫ | Delete the selected mark, or the selected chats |
 | ⇧/⌘-click | Select several chats |
-| ⌫ | Delete the selected chats |
+
+## Layout
+
+| File | What lives there |
+| --- | --- |
+| `Pages.swift` | Sheet metrics, pagination, the document view, and the ink scan the highlighter snaps to |
+| `Annotations.swift` | Markup state, the layer drawn over each sheet, and the inline inspector |
+| `Dictation.swift` | Microphone capture through `SpeechAnalyzer` |
+| `PDFExport.swift` | Sheets to vector PDF, notes to PDF annotations |
+| `PagesHandoff.swift` | Markdown to styled RTF for Apple Pages |
+| `Search.swift` | Matching, snippets, the toolbar field, and the sidebar row |
+| `MarkdownView.swift` | The Markdown parser and renderer |
+| `Runtime.swift` | The `basert` CLI: model list, downloads, and the local server |
+
+## Licence
+
+BaseChat is free software under the **GNU Affero General Public License, version 3 or later** —
+see [`LICENSE`](LICENSE). If you run a modified version where users interact with it over a
+network, section 13 requires you to offer them its source.
 
 ## Credits
 

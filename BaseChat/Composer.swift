@@ -196,6 +196,15 @@ final class ComposerController {
 /// NSTextView with markdown-safe typing (no smart quotes/dashes) and ⌘↩ to send.
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    /// Fired when the caret lands here, so the rest of the app can drop any
+    /// selection that would otherwise swallow the next Delete.
+    var onFocus: (() -> Void)?
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { onFocus?() }
+        return accepted
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.command), event.keyCode == 36 {
@@ -211,11 +220,13 @@ struct MarkdownEditor: NSViewRepresentable {
     @Binding var height: CGFloat
     var controller: ComposerController
     var onSubmit: () -> Void
+    var onFocus: () -> Void = {}
 
     func makeNSView(context: Context) -> NSScrollView {
         let textView = ComposerTextView()
         textView.delegate = context.coordinator
         textView.onSubmit = onSubmit
+        textView.onFocus = onFocus
         textView.isRichText = false
         textView.font = .systemFont(ofSize: NSFont.systemFontSize)
         textView.drawsBackground = false
@@ -243,6 +254,7 @@ struct MarkdownEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? ComposerTextView else { return }
         textView.onSubmit = onSubmit
+        textView.onFocus = onFocus
         if textView.string != text {
             textView.string = text
         }
