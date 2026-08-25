@@ -36,13 +36,28 @@ enum AnnotationTool: Hashable {
 final class AnnotationState {
     var tool: AnnotationTool = .none
     var ink: Annotation.Ink = .yellow
-    var selection: Annotation.ID?
+    /// Marks are selected several at a time — ⇧-click adds to the set — so a
+    /// group of shapes moves and deletes as one.
+    var selected: Set<Annotation.ID> = []
     var editing: Annotation.ID?
+
+    /// The lone selected mark, when there is exactly one. Resize handles and
+    /// the inline inspector are single-object controls, so they ask for this.
+    var selection: Annotation.ID? {
+        get { selected.count == 1 ? selected.first : nil }
+        set { selected = newValue.map { [$0] } ?? [] }
+    }
+
+    func isSelected(_ id: Annotation.ID) -> Bool { selected.contains(id) }
+
+    func clearSelection() {
+        selected.removeAll()
+        editing = nil
+    }
 
     func arm(_ tool: AnnotationTool) {
         self.tool = self.tool == tool ? .none : tool
-        selection = nil
-        editing = nil
+        clearSelection()
     }
 }
 
@@ -117,9 +132,16 @@ struct AnnotationLayer: View {
     var onUpdate: (Annotation) -> Void = { _ in }
     var onDelete: (Annotation.ID) -> Void = { _ in }
 
-    /// Set while a mark is being drawn or dragged; it shadows the stored one.
+    /// Set while a mark is being drawn; it shadows the stored one.
     @State private var draft: Annotation?
     @State private var dragOrigin: CGPoint?
+    /// Preview positions for the marks travelling with the current drag —
+    /// a whole selection moves together, so one shadow is not enough.
+    @State private var moving: [Annotation.ID: Annotation] = [:]
+    /// Which mark the pointer went down on, and whether it was already part of
+    /// the selection then — a ⇧-click can only take a mark back out if it was.
+    @State private var grabbed: Annotation.ID?
+    @State private var grabWasSelected = false
 
     private var mine: [Annotation] {
         annotations.filter { $0.page == page && (renderNotes || $0.kind != .text) }
@@ -127,7 +149,8 @@ struct AnnotationLayer: View {
 
     /// What to paint for a mark right now — the drag preview wins.
     private func live(_ annotation: Annotation) -> Annotation {
-        draft?.id == annotation.id ? draft! : annotation
+        if let dragged = moving[annotation.id] { return dragged }
+        return draft?.id == annotation.id ? draft! : annotation
     }
 
     var body: some View {
@@ -145,7 +168,7 @@ struct AnnotationLayer: View {
                     }
                 )
                 .contentShape(hitShape(shown))
-                .zIndex(state.selection == annotation.id ? 1 : 0)
+                .zIndex(state.isSelected(annotation.id) ? 1 : 0)
                 .onTapGesture(count: 2) {
                     guard self.live, !state.tool.isDrawing else { return }
                     state.selection = annotation.id
@@ -160,9 +183,15 @@ struct AnnotationLayer: View {
             }
 
             // Selection chrome and the inline inspector sit above every mark so
-            // the handle stays grabbable even when marks overlap.
-            if live, let id = state.selection, let selected = mine.first(where: { $0.id == id }) {
-                selectionChrome(for: live(selected), stored: selected)
+            // the handle stays grabbable even when marks overlap. Every selected
+            // mark is outlined; only a lone one gets handles and an inspector.
+            if live {
+                ForEach(mine.filter { state.isSelected($0.id) }) { selected in
+                    selectionOutline(for: self.live(selected))
+                }
+                if let id = state.selection, let selected = mine.first(where: { $0.id == id }) {
+                    selectionChrome(for: self.live(selected), stored: selected)
+                }
             }
 
             if let draft, !mine.contains(where: { $0.id == draft.id }) {
@@ -292,22 +321,52 @@ struct AnnotationLayer: View {
     private func grabGesture(_ annotation: Annotation) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if state.selection != annotation.id {
-                    state.selection = annotation.id
-                    state.editing = nil
+                if grabbed != annotation.id {
+                    grabbed = annotation.id
+                    grabWasSelected = state.isSelected(annotation.id)
+                    // ⇧ adds to the selection instead of replacing it.
+                    if !grabWasSelected {
+                        if Self.shiftHeld {
+                            state.selected.insert(annotation.id)
+                        } else {
+                            state.selected = [annotation.id]
+                        }
+                        state.editing = nil
+                    }
                 }
                 guard !annotation.isTextMark, moved(value.translation) else { return }
-                draft = shifted(annotation, by: value.translation)
+                moving = group(around: annotation).reduce(into: [:]) { result, mark in
+                    result[mark.id] = shifted(mark, by: value.translation)
+                }
             }
             .onEnded { value in
-                state.selection = annotation.id
-                if !annotation.isTextMark, moved(value.translation) {
-                    onUpdate(shifted(annotation, by: value.translation))
+                let dragged = moved(value.translation)
+                if !dragged {
+                    if Self.shiftHeld {
+                        // A second ⇧-click takes a mark back out of the group.
+                        if grabWasSelected, state.selected.count > 1 {
+                            state.selected.remove(annotation.id)
+                        }
+                    } else {
+                        state.selected = [annotation.id]
+                    }
+                }
+                if !annotation.isTextMark, dragged {
+                    for mark in moving.values { onUpdate(mark) }
                 } else if state.editing != annotation.id {
                     state.editing = nil
                 }
-                draft = nil
+                moving = [:]
+                grabbed = nil
             }
+    }
+
+    /// The marks that travel with `annotation`: the whole selection when it is
+    /// part of one, and only what is on this sheet — a mark on another page is
+    /// drawn by that page's own layer, which knows nothing about this drag.
+    private func group(around annotation: Annotation) -> [Annotation] {
+        guard state.isSelected(annotation.id), state.selected.count > 1 else { return [annotation] }
+        return mine.filter { state.isSelected($0.id) && !$0.isTextMark }
     }
 
     private func moved(_ translation: CGSize) -> Bool {
@@ -394,6 +453,19 @@ struct AnnotationLayer: View {
 
     // MARK: Selection chrome
 
+    /// The dashed box around a selected mark. A text mark is a run of lines, so
+    /// outline each band. Drawing one box around the union would claim the empty
+    /// space to the right of the first line and the left of the last.
+    private func selectionOutline(for shown: Annotation) -> some View {
+        ForEach(Array(outlines(for: shown).enumerated()), id: \.offset) { _, frame in
+            Rectangle()
+                .stroke(Self.outline, style: .init(lineWidth: 0.5, dash: [3, 2]))
+                .frame(width: frame.width, height: frame.height)
+                .offset(x: frame.minX, y: frame.minY)
+                .allowsHitTesting(false)
+        }
+    }
+
     @ViewBuilder
     private func selectionChrome(for shown: Annotation, stored: Annotation) -> some View {
         let box = pixels(shown.rect).insetBy(dx: -3, dy: -3)
@@ -406,17 +478,6 @@ struct AnnotationLayer: View {
         let barX = max(0, min(box.minX, size.width - AnnotationInspector.maxWidth / scale))
 
         ZStack(alignment: .topLeading) {
-            // A text mark is a run of lines, so outline each band. Drawing one
-            // box around the union would claim the empty space to the right of
-            // the first line and the left of the last.
-            ForEach(Array(outlines(for: shown).enumerated()), id: \.offset) { _, frame in
-                Rectangle()
-                    .stroke(Self.outline, style: .init(lineWidth: 0.5, dash: [3, 2]))
-                    .frame(width: frame.width, height: frame.height)
-                    .offset(x: frame.minX, y: frame.minY)
-                    .allowsHitTesting(false)
-            }
-
             // A selection is not an object — nothing to drag or size.
             if !stored.isTextMark {
                 ForEach(Corner.allCases, id: \.self) { corner in
@@ -860,5 +921,60 @@ private struct NoteBox: View {
             }
         }
         .onAppear { draft = annotation.text }
+    }
+}
+
+// MARK: - ⌫ over the document
+
+/// Deletes whatever marks are selected when ⌫ or ⌦ is pressed.
+///
+/// A menu item carrying a `⌫` key equivalent looks like the tidy way to do
+/// this, but a `Commands` body is not a view: it does not re-read the
+/// observable selection, so the item stayed disabled and the key never reached
+/// it. A local monitor sees the key before the menu does and decides on live
+/// state — and gets out of the way whenever a caret is in a field.
+struct DeleteMarkupKey: ViewModifier {
+    let state: AnnotationState
+    let perform: () -> Void
+
+    @State private var monitor: Any?
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                guard monitor == nil else { return }
+                monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard Self.isDelete(event), state.editing == nil,
+                          !state.selected.isEmpty, !Self.isTyping
+                    else { return event }
+                    perform()
+                    return nil
+                }
+            }
+            .onDisappear {
+                if let monitor { NSEvent.removeMonitor(monitor) }
+                monitor = nil
+            }
+    }
+
+    /// 51 is ⌫; 117 is the ⌦ of a full keyboard. ⌘⌫ belongs to whatever else
+    /// wants it — moving a file to the trash, say — so it is left alone.
+    private static func isDelete(_ event: NSEvent) -> Bool {
+        (event.keyCode == 51 || event.keyCode == 117)
+            && !event.modifierFlags.contains(.command)
+    }
+
+    /// True while the caret is in a field or a note: the composer, the search
+    /// field and an open note all keep their own delete key.
+    private static var isTyping: Bool {
+        let responder = NSApp.keyWindow?.firstResponder
+        if let text = responder as? NSTextView { return text.isEditable }
+        return responder is NSTextField
+    }
+}
+
+extension View {
+    func deleteMarkupKey(_ state: AnnotationState, perform: @escaping () -> Void) -> some View {
+        modifier(DeleteMarkupKey(state: state, perform: perform))
     }
 }

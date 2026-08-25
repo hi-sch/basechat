@@ -19,6 +19,14 @@ enum Paper {
     static let bodySize: CGFloat = 11
     /// Breathing room around the ink of a line when a highlight is painted.
     static let inkPad: CGFloat = 1
+    /// A hair of content above the first sheet, scrolled away at rest.
+    ///
+    /// The title bar and the toolbar both draw a flat "at the top" appearance
+    /// while the scroll view sits at offset zero, and neither can be talked out
+    /// of it. One point of lead-in means the document is always *just* scrolled,
+    /// so the header keeps the look it has everywhere else — and the sheet's top
+    /// edge still lands exactly on the top edge of the window.
+    static let scrollLead: CGFloat = 1
 
     static var contentWidth: CGFloat { width - margin * 2 }
     static var contentHeight: CGFloat { height - margin * 2 - footer }
@@ -245,11 +253,18 @@ struct PagedTranscript: View {
     var onCreate: (Annotation) -> Void = { _ in }
     var onUpdate: (Annotation) -> Void = { _ in }
     var onDelete: (Annotation.ID) -> Void = { _ in }
+    /// The turn holding the search hit the field is parked on, plus a token
+    /// that changes on every jump so the same turn can be revealed twice.
+    var focus: Message.ID?
+    var focusToken: Int = 0
 
     /// Which chat the scroll handlers are following, so switching chats is not
     /// mistaken for a message being sent.
     @State private var following: Chat.ID?
     @State private var position = ScrollPosition(idType: Int.self)
+    /// False while a chat is being opened. Until the opening scroll has settled
+    /// it owns the position, and the handlers that follow a reply keep off.
+    @State private var settled = false
 
     private var messages: [Message] { chat?.messages ?? [] }
     private var pages: [[Placement]] { layout.pages(messages) }
@@ -267,7 +282,7 @@ struct PagedTranscript: View {
 
     /// Distance from the top of the scroll content to a fragment's top edge.
     private func documentY(page: Int, placement: Placement, scale: CGFloat) -> CGFloat {
-        Paper.sideGutter * 2
+        Paper.scrollLead
             + CGFloat(page) * (Paper.height * scale + Paper.gutter)
             + (Paper.margin + placement.y) * scale
     }
@@ -302,44 +317,90 @@ struct PagedTranscript: View {
                         .id(index)
                     }
                 }
-                // Twice the side gutter above the first sheet and below the last.
-                .padding(.vertical, Paper.sideGutter * 2)
+                // Only `scrollLead` above the first sheet — see its note — and
+                // twice the side gutter below the last.
+                .padding(.top, Paper.scrollLead)
+                .padding(.bottom, Paper.sideGutter * 2)
                 .frame(maxWidth: .infinity)
             }
             // Offsets rather than view ids: the turns live inside a scaled sheet,
             // where ScrollViewReader cannot find them, and the positions we want
             // fall straight out of the pagination anyway.
             .scrollPosition($position)
+            // A chat switch changes the last turn's text as surely as a token
+            // arriving does, so without this the opening scroll was dragged
+            // straight back down to the tail of the chat being opened.
             .onChange(of: messages.last?.text) { _, _ in
+                guard settled else { return }
                 follow(viewport: geometry.size.height, scale: scale)
             }
             // Sending appends the prompt and then the empty reply, so the count
             // moves by one or two. Anything larger is a chat switch.
             .onChange(of: messages.count) { old, new in
-                guard following == chat?.id, new > old, new - old <= 2 else { return }
+                guard settled, following == chat?.id, new > old, new - old <= 2 else { return }
                 withAnimation(.easeOut(duration: 0.2)) {
                     showPrompt(scale: scale)
                 }
             }
-            .onChange(of: chat?.id) { _, new in
-                following = new
-                alignToTop()
+            .onChange(of: focusToken) { _, _ in
+                reveal(scale: scale)
             }
-            // Start with the first sheet's top edge flush to the window, so the
-            // grey band above it is scrolled away.
-            .onAppear {
+            // Opening a chat starts it at the top. The layout puts the first
+            // sheet there already, so this only has to undo where the previous
+            // chat was left scrolled to — and it has to keep undoing it, since
+            // the new chat's turns are measured by the off-screen ruler a frame
+            // or two later and every measurement repaginates underneath.
+            .task(id: chat?.id) {
+                settled = false
                 following = chat?.id
-                alignToTop()
+                state.clearSelection()
+                for step in 0..<12 {
+                    alignToTop()
+                    if step >= 2, !messages.contains(where: layout.needsMeasuring) { break }
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                }
+                settled = true
             }
             .background(Color(nsColor: .underPageBackgroundColor))
             .background { ruler }
         }
+        // The toolbar hands the detail view a top safe-area inset, which starts
+        // the document below the header. Taking it back puts the top of the
+        // first sheet on the top edge of the window, which is where it belongs.
+        // It has to be applied out here: inside the GeometryReader the frame is
+        // already inset, so ignoring it there measures as a no-op.
+        .ignoresSafeArea(.container, edges: .top)
+    }
+
+    /// Title bar plus toolbar — the strip the document now runs under. Anything
+    /// scrolled "to the top" means the top of the readable area, so it has to
+    /// clear this first. AppKit knows the height; the safe area no longer does,
+    /// because we just gave it away.
+    private var headerLead: CGFloat {
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first,
+              let content = window.contentView
+        else { return 0 }
+        return max(0, content.frame.height - window.contentLayoutRect.height)
     }
 
     // MARK: Scrolling
 
     private func alignToTop() {
-        position.scrollTo(y: Paper.sideGutter * 2)
+        position.scrollTo(y: Paper.scrollLead)
+    }
+
+    /// Brings the turn holding the current search hit into view, a little clear
+    /// of the top edge so it does not sit against the window chrome.
+    private func reveal(scale: CGFloat) {
+        guard let focus,
+              let message = messages.first(where: { $0.id == focus }),
+              let at = locate(message, last: false, in: pages)
+        else { return }
+        let top = documentY(page: at.page, placement: at.placement, scale: scale)
+            - headerLead - Paper.gutter * 2
+        withAnimation(.easeOut(duration: 0.2)) {
+            position.scrollTo(y: max(Paper.scrollLead, top))
+        }
     }
 
     /// Brings the prompt that started the current exchange to the top.
@@ -347,7 +408,9 @@ struct PagedTranscript: View {
         guard let prompt = messages.last(where: { $0.role == .user }),
               let at = locate(prompt, last: false, in: pages)
         else { return }
-        position.scrollTo(y: documentY(page: at.page, placement: at.placement, scale: scale) - Paper.gutter)
+        position.scrollTo(y: max(Paper.scrollLead,
+                                 documentY(page: at.page, placement: at.placement, scale: scale)
+                                     - headerLead - Paper.gutter))
     }
 
     /// Leaves the prompt at the top while the reply still fits underneath it,
@@ -364,10 +427,12 @@ struct PagedTranscript: View {
         let tailBottom = documentY(page: tailAt.page, placement: tailAt.placement, scale: scale)
             + tailAt.placement.height * scale
 
-        if tailBottom - promptTop > viewport - Paper.gutter * 2 {
-            position.scrollTo(y: tailBottom - viewport + Paper.gutter * 2)
+        // The viewport runs from the top of the window, so what can actually be
+        // read is what is left of it under the header.
+        if tailBottom - promptTop > viewport - headerLead - Paper.gutter * 2 {
+            position.scrollTo(y: max(Paper.scrollLead, tailBottom - viewport + Paper.gutter * 2))
         } else {
-            position.scrollTo(y: promptTop - Paper.gutter)
+            position.scrollTo(y: max(Paper.scrollLead, promptTop - headerLead - Paper.gutter))
         }
     }
 
@@ -419,8 +484,7 @@ struct PageView: View {
             Color.white
                 .onTapGesture {
                     guard live, !state.tool.isDrawing else { return }
-                    state.selection = nil
-                    state.editing = nil
+                    state.clearSelection()
                 }
 
             ZStack(alignment: .topLeading) {

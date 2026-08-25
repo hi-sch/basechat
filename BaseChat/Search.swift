@@ -33,6 +33,49 @@ final class SearchModel {
         query = ""
         scope = .everywhere
         visible = false
+        matches = []
+        matchIndex = 0
+    }
+
+    // MARK: Walking the hits
+
+    /// One occurrence of the term in the open chat. Turns are the finest thing
+    /// the document can be scrolled to, so a hit is identified by its turn and
+    /// its position within it.
+    struct Match: Equatable {
+        let message: Message.ID
+        let ordinal: Int
+    }
+
+    private(set) var matches: [Match] = []
+    private(set) var matchIndex = 0
+    /// Bumped on every jump, so the transcript scrolls again even when the next
+    /// hit sits in the turn it is already showing.
+    private(set) var jump = 0
+
+    var currentMatch: Match? {
+        matches.indices.contains(matchIndex) ? matches[matchIndex] : nil
+    }
+
+    /// `2 / 7`, or nothing at all when the term matches nothing.
+    var matchLabel: String {
+        matches.isEmpty ? "" : "\(matchIndex + 1)/\(matches.count)"
+    }
+
+    /// Re-seeds the list and parks on the first hit, which is what brings it
+    /// into view the moment a term starts matching.
+    func setMatches(_ found: [Match]) {
+        guard found != matches else { return }
+        matches = found
+        matchIndex = 0
+        if !found.isEmpty { jump += 1 }
+    }
+
+    /// ↩ in the field: the next hit, wrapping back to the first after the last.
+    func advance() {
+        guard !matches.isEmpty else { return }
+        matchIndex = (matchIndex + 1) % matches.count
+        jump += 1
     }
 }
 
@@ -164,8 +207,16 @@ struct SearchField: View {
 
             SearchTextField(text: $search.query,
                             focusRequests: search.focusRequests,
-                            onCancel: { search.exit() })
+                            onCancel: { search.exit() },
+                            onSubmit: { search.advance() })
                 .frame(width: 150, height: 18)
+
+            if !search.matchLabel.isEmpty {
+                Text(search.matchLabel)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("↩ for the next match")
+            }
 
             Button {
                 search.exit()
@@ -191,6 +242,7 @@ struct SearchTextField: NSViewRepresentable {
     @Binding var text: String
     var focusRequests: Int
     var onCancel: () -> Void
+    var onSubmit: () -> Void = {}
 
     func makeNSView(context: Context) -> NSTextField {
         let field = NSTextField()
@@ -208,6 +260,7 @@ struct SearchTextField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.onCancel = onCancel
+        context.coordinator.onSubmit = onSubmit
         if field.stringValue != text {
             field.stringValue = text
         }
@@ -216,17 +269,22 @@ struct SearchTextField: NSViewRepresentable {
         context.coordinator.claimFocus(of: field)
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(text: $text, onCancel: onCancel) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, onCancel: onCancel, onSubmit: onSubmit)
+    }
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         private let text: Binding<String>
         var onCancel: () -> Void
+        var onSubmit: () -> Void
         /// Which focus request has already been honoured.
         var servedRequest = -1
 
-        init(text: Binding<String>, onCancel: @escaping () -> Void) {
+        init(text: Binding<String>, onCancel: @escaping () -> Void,
+             onSubmit: @escaping () -> Void) {
             self.text = text
             self.onCancel = onCancel
+            self.onSubmit = onSubmit
         }
 
         /// The field is created before it joins a window, so keep asking for a
@@ -252,6 +310,12 @@ struct SearchTextField: NSViewRepresentable {
         func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
             if selector == #selector(NSResponder.cancelOperation(_:)) {
                 onCancel()
+                return true
+            }
+            // ↩ walks the hits rather than ending the search, so the caret can
+            // stay in the field while the document moves under it.
+            if selector == #selector(NSResponder.insertNewline(_:)) {
+                onSubmit()
                 return true
             }
             return false

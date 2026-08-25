@@ -9,6 +9,7 @@ struct BaseChatApp: App {
     @State private var markup = AnnotationState()
     @State private var search = SearchModel()
     @State private var layout = DocumentLayout()
+    @State private var localServer = LocalServer()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
@@ -21,10 +22,12 @@ struct BaseChatApp: App {
                 .environment(markup)
                 .environment(search)
                 .environment(layout)
+                .environment(localServer)
                 .frame(minWidth: 780, minHeight: 520)
                 .onAppear {
                     delegate.runtime = runtime
                     delegate.store = store
+                    delegate.localServer = localServer
                 }
         }
         .defaultSize(width: 1040, height: 720)
@@ -37,17 +40,10 @@ struct BaseChatApp: App {
                 Button("Find…") { search.open() }
                     .keyboardShortcut("f", modifiers: .command)
 
-                // Delete only binds while a mark is selected and no note is
-                // being typed in, and the composer drops the selection as soon
-                // as the caret lands there, so ordinary editing keeps its key.
-                Button("Delete Markup") {
-                    guard let chat = store.currentID, let mark = markup.selection else { return }
-                    store.removeAnnotation(mark, in: chat)
-                    markup.selection = nil
-                    markup.editing = nil
-                }
-                .keyboardShortcut(.delete, modifiers: [])
-                .disabled(markup.selection == nil || markup.editing != nil)
+                // ⌫ for the selected markup used to live here as a menu item.
+                // A `Commands` body is not a view, so it never re-read the
+                // selection and the item stayed disabled — the transcript owns
+                // that key now, through `deleteMarkupKey`.
             }
         }
     }
@@ -57,12 +53,14 @@ struct BaseChatApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var runtime: Runtime?
     var store: ChatStore?
+    var localServer: LocalServer?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
             store?.flush()
+            localServer?.stop()
             runtime?.stopServer()
         }
     }

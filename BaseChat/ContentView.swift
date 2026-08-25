@@ -4,12 +4,32 @@ struct ContentView: View {
     @Environment(ChatStore.self) private var store
     @Environment(Runtime.self) private var runtime
     @Environment(SearchModel.self) private var search
+    @Environment(LocalServer.self) private var localServer
     @State private var showModels = false
+    @State private var showLocalServer = false
 
     var body: some View {
+        chrome
+            // While the endpoint is up the app is being driven from outside;
+            // the curtain and the settings sheet are attached after this, so
+            // they stay live when everything under them stops taking clicks.
+            .disabled(localServer.isRunning)
+            .sheet(isPresented: $showLocalServer) {
+                LocalServerSheet()
+            }
+            .overlay {
+                if localServer.isRunning {
+                    LocalServerCurtain(server: localServer)
+                }
+            }
+            .background(TitlebarPin())
+            .task { await runtime.bootstrap() }
+    }
+
+    private var chrome: some View {
         @Bindable var store = store
 
-        NavigationSplitView {
+        return NavigationSplitView {
             List(selection: $store.selection) {
                 ForEach(visibleChats) { chat in
                     ChatRow(chat: chat, term: search.isActive ? search.term : "")
@@ -40,12 +60,11 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            ChatView(showModels: $showModels)
+            ChatView(showModels: $showModels, showLocalServer: $showLocalServer)
         }
         .sheet(isPresented: $showModels) {
             ModelsSheet()
         }
-        .task { await runtime.bootstrap() }
     }
 
     /// While searching the sidebar becomes a result list, Notes-style.
@@ -80,6 +99,7 @@ struct ChatView: View {
     @Environment(SearchModel.self) private var search
     @Environment(DocumentLayout.self) private var layout
     @Binding var showModels: Bool
+    @Binding var showLocalServer: Bool
 
     @AppStorage("pagedLayout") private var paged = true
 
@@ -98,12 +118,38 @@ struct ChatView: View {
             .overlay { statusOverlay }
             .navigationTitle(store.current?.title ?? "BaseChat")
             .toolbar { toolbarContent }
+            // The toolbar draws itself flat while the scroll view is at its top
+            // and picks up its material once content passes under it. The
+            // document starts *under* the header here, so the flat state is
+            // never the one to show — ask for the background outright.
+            .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
             .onDeleteCommand(perform: deleteSelectedAnnotation)
+            .deleteMarkupKey(annotations, perform: deleteSelectedAnnotation)
             .onExitCommand {
                 // An open-but-empty field still counts: Escape closes the field
                 // exactly like its own x button.
                 if search.visible { search.exit() } else { annotations.arm(.none) }
             }
+            // Every hit in the open chat, so ↩ can walk them and the document
+            // can bring each one into view.
+            .onChange(of: search.term) { _, _ in indexMatches() }
+            .onChange(of: search.visible) { _, _ in indexMatches() }
+            .onChange(of: store.currentID) { _, _ in indexMatches() }
+    }
+
+    private func indexMatches() {
+        guard search.isActive, let chat = store.current else {
+            search.setMatches([])
+            return
+        }
+        var found: [SearchModel.Match] = []
+        for message in chat.messages {
+            let count = SearchIndex.ranges(in: message.text, term: search.term).count
+            for ordinal in 0..<count {
+                found.append(SearchModel.Match(message: message.id, ordinal: ordinal))
+            }
+        }
+        search.setMatches(found)
     }
 
     private var messages: [Message] { store.current?.messages ?? [] }
@@ -130,13 +176,17 @@ struct ChatView: View {
                 onDelete: { annotationID in
                     guard let id = store.currentID else { return }
                     store.removeAnnotation(annotationID, in: id)
-                }
+                },
+                focus: search.currentMatch?.message,
+                focusToken: search.jump
             )
         } else {
             ContinuousTranscript(messages: messages,
                                  highlight: term,
                                  onRegenerate: regenerate,
-                                 onOpenInPages: openInPages)
+                                 onOpenInPages: openInPages,
+                                 focus: search.currentMatch?.message,
+                                 focusToken: search.jump)
         }
     }
 
@@ -262,10 +312,7 @@ struct ChatView: View {
             }
             MarkdownEditor(text: $draft, height: $composerHeight, controller: composer,
                            onSubmit: send,
-                           onFocus: {
-                               annotations.selection = nil
-                               annotations.editing = nil
-                           })
+                           onFocus: { annotations.clearSelection() })
                 .frame(height: composerHeight)
         }
         .frame(minHeight: 21)
@@ -386,6 +433,12 @@ struct ChatView: View {
                 }
                 .keyboardShortcut("f", modifiers: .command)
 
+                Button {
+                    showLocalServer = true
+                } label: {
+                    Label("Local Server…", systemImage: "point.3.connected.trianglepath.dotted")
+                }
+
                 Divider()
                 Toggle("Page Layout", isOn: $paged)
                 Button("Clear Markup", role: .destructive) {
@@ -424,10 +477,11 @@ struct ChatView: View {
     }
 
     private func deleteSelectedAnnotation() {
-        guard let id = store.currentID, let selected = annotations.selection else { return }
-        store.removeAnnotation(selected, in: id)
-        annotations.selection = nil
-        annotations.editing = nil
+        guard let id = store.currentID, !annotations.selected.isEmpty else { return }
+        for mark in annotations.selected {
+            store.removeAnnotation(mark, in: id)
+        }
+        annotations.clearSelection()
     }
 
     private var modelLabel: String {
@@ -478,19 +532,8 @@ struct ChatView: View {
                 action: ("Manage Models", { showModels = true })
             )
         case .ready, .locating:
-            if messages.isEmpty, runtime.status.isReady {
-                VStack(spacing: 12) {
-                    LogoMark()
-                        .foregroundStyle(.tint)
-                        .frame(width: 52, height: 52)
-                    Text("Ask anything")
-                        .font(.title3.weight(.semibold))
-                    Text("\(modelLabel) is loaded and running locally.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .allowsHitTesting(false)
-            }
+            // A new chat is a blank sheet and nothing else — no watermark on it.
+            EmptyView()
         }
     }
 
@@ -571,6 +614,10 @@ struct ContinuousTranscript: View {
     let highlight: String
     var onRegenerate: (Message) -> Void = { _ in }
     var onOpenInPages: (Message) -> Void = { _ in }
+    /// The turn holding the search hit the field is parked on, plus a token
+    /// that changes on every jump so the same turn can be revealed twice.
+    var focus: Message.ID?
+    var focusToken: Int = 0
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -592,6 +639,10 @@ struct ContinuousTranscript: View {
             .onChange(of: messages.last?.text) { _, _ in
                 guard let last = messages.last?.id else { return }
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(last, anchor: .bottom) }
+            }
+            .onChange(of: focusToken) { _, _ in
+                guard let focus else { return }
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(focus, anchor: .top) }
             }
         }
     }
@@ -885,5 +936,28 @@ struct Notice: View {
         .padding(30)
         .frame(maxWidth: 460)
         .glassEffect(.regular, in: .rect(cornerRadius: 22))
+    }
+}
+
+
+/// Reaches the `NSWindow` behind the view to hold the title bar in its scrolled
+/// state. SwiftUI's toolbar modifier covers the toolbar's own background; the
+/// separator under the title bar is AppKit's, and it too switches on whether a
+/// scroll view is at its top — which, with the document running under the
+/// header, it always is.
+struct TitlebarPin: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async { pin(view.window) }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async { pin(view.window) }
+    }
+
+    private func pin(_ window: NSWindow?) {
+        guard let window, window.toolbar != nil else { return }
+        window.titlebarSeparatorStyle = .shadow
     }
 }

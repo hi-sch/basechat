@@ -36,7 +36,15 @@ one.
 lists, quotes and code arrive already formatted.
 
 **Search.** Scoped to all chats or the current one. The sidebar becomes a result list with match
-counts and snippets, and every hit in the transcript takes a yellow wash.
+counts and snippets, and every hit in the transcript takes a yellow wash. The first hit is brought
+into view as soon as the term matches; ↩ walks to the next one and wraps around at the end, with a
+counter beside the field saying where you are.
+
+**Local Server.** In the ⋯ menu. Serves the loaded model over HTTP in the OpenAI format, on a port
+you pick rather than the one BaseRT happened to take, optionally behind a key of your own and
+loopback-only by default — so a coding agent can be pointed at one fixed address. While it runs the
+window is covered, because two drivers on one conversation is a race nobody wins; the curtain has
+the stop button on it.
 
 **Per-turn metadata.** Each turn carries a timestamp; answers carry the id of the model that wrote
 them, so switching models mid-chat leaves the older answers labelled correctly. Regenerate rewinds
@@ -56,7 +64,7 @@ to a prompt and asks again from there.
 ## Run
 
 A built app is in `dist/BaseChat.app` — double-click it, or drag it to `/Applications`.
-`BaseChat-0.2.dmg` is the distributable: a 640×400 install window with the app, an Applications
+`BaseChat-0.2.1.dmg` is the distributable: a 640×400 install window with the app, an Applications
 alias, and an arrow between them.
 
 ## Packaging
@@ -113,8 +121,10 @@ codesign --force --deep --sign - dist/BaseChat.app
 | ⌘B | Bold |
 | ⌘I | Italic |
 | ⇧ while resizing | Keep a shape's proportions |
-| ⌫ | Delete the selected mark, or the selected chats |
+| ↩ (in the search field) | Jump to the next match, wrapping at the end |
+| ⌫ | Delete the selected marks, or the selected chats |
 | ⇧/⌘-click | Select several chats |
+| ⇧-click on a mark | Add it to the selection, or take it back out |
 
 ## Layout
 
