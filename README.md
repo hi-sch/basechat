@@ -1,8 +1,9 @@
 # BaseChat
 
-A SwiftUI chat app for [BaseRT](https://basecompute.co), in the spirit of Notes and Preview:
-a sidebar of chats, a transcript laid out as pages, and a composer. Models run locally through
-the `basert` CLI — nothing leaves the machine.
+A SwiftUI chat app for local models, in the spirit of Notes and Preview: a sidebar of chats,
+a transcript laid out as pages, and a composer. Inference stays on the Mac. The app picks the
+first runtime that is actually installed: [Edge0](https://github.com/Edge0-AI/edge0), then
+[BaseRT](https://basecompute.co), then in-process [MLX](https://github.com/ml-explore/mlx-swift-lm).
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/hi-sch/basechat/refs/heads/main/BaseChat.png" width="96%" alt="BaseChat Screenshot">
@@ -27,6 +28,7 @@ band covers the letters and nothing else — no colour past the last word or abo
 letter. They can be recoloured and deleted, not dragged. Shapes, notes and freehand sketches are
 objects: select, move, resize from any corner (hold ⇧ to keep proportions), and restyle from an
 inline inspector — any border and fill colour, opacity included, through the system colour panel.
+Markup is available in both the paginated document and the continuous transcript.
 
 **PDF export.** Each sheet is drawn into a `CGPDFContext`, so the output is vector with selectable
 text. Notes become real PDF text annotations, so they open as notes rather than as a picture of
@@ -36,25 +38,47 @@ one.
 lists, quotes and code arrive already formatted.
 
 **Search.** Scoped to all chats or the current one. The sidebar becomes a result list with match
-counts and snippets, and every hit in the transcript takes a yellow wash. The first hit is brought
-into view as soon as the term matches; ↩ walks to the next one and wraps around at the end, with a
-counter beside the field saying where you are.
+counts and snippets, and every hit in the transcript takes a yellow wash. Hits include message
+text, hidden reasoning, model ids, and note annotations. The first hit is brought into view as
+soon as the term matches; ↩ walks to the next one and wraps around at the end, with a counter
+beside the field saying where you are.
+
+**Three engines.** On launch the app checks for **Edge0**, then **BaseRT**, and falls back to **MLX**
+so it still opens with nothing extra installed. The toolbar model menu (and the Models sheet)
+lists only the engines that are present. Detection re-runs when the app becomes active, so
+installing a CLI does not need a restart.
+
+- **Edge0** — `edge0 serve` for the two shipping MoE tiers, `edge0-8b` and `edge0-35b` ([Edge0/Edge0-8B-A1B-preview](https://huggingface.co/Edge0/Edge0-8B-A1B-preview) and [Edge0/Edge0-35B-A3B-preview](https://huggingface.co/Edge0/Edge0-35B-A3B-preview)). OpenAI-compatible HTTP on loopback. **The Edge0 runtime can run a Qwen-based 35B parameter model with ~2.9 GB peak active memory (on disk ~23GB).**
+- **BaseRT** — converts Hugging Face repos to `.base` and serves them over loopback HTTP. **The BaseRT runtime can run LLMs that are optimized for Apple Silicon (M3-M6).**
+- **MLX** — loads Hugging Face safetensors on the GPU in-process. No extra CLI. Later turns in a
+  chat reuse the KV cache instead of prefilling the whole history.
 
 **Local Server.** In the ⋯ menu. Serves the loaded model over HTTP in the OpenAI format, on a port
-you pick rather than the one BaseRT happened to take, optionally behind a key of your own and
-loopback-only by default — so a coding agent can be pointed at one fixed address. While it runs the
-window is covered, because two drivers on one conversation is a race nobody wins; the curtain has
-the stop button on it.
+you pick, optionally behind a key of your own and loopback-only by default — so a coding agent can
+be pointed at one fixed address. MLX answers those calls in-process; Edge0 and BaseRT are proxied.
+A bearer key is required if loopback-only is turned off. While it runs the window is covered,
+because two drivers on one conversation is a race nobody wins; the curtain has the stop button on it.
 
 **Per-turn metadata.** Each turn carries a timestamp; answers carry the id of the model that wrote
-them, so switching models mid-chat leaves the older answers labelled correctly. Regenerate rewinds
-to a prompt and asks again from there.
+them, so switching models mid-chat leaves the older answers labelled correctly. Assistant turns
+can also show tokens/s. Reasoning (`<think>…</think>`) is folded under a Thinking disclosure.
+Regenerate rewinds to a prompt and asks again from there. If the prompt would overflow the context
+budget, older turns are dropped and the reply says so.
+
+**Composer.** You can type, format, and dictate while a model is still loading; only Send waits
+until the engine is ready. Hub downloads have a Cancel button.
+
+**Chats.** Double-click a sidebar title (or Rename in the context menu) to name a chat. Delete
+chat and delete markup both undo with ⌘Z. A failed write of `chats.json` shows an error above the
+composer instead of failing silently.
 
 
 ## Requirements
 
-- macOS 26+, Xcode 26+
-- The `basert` CLI installed (auto-detected at `~/.basert/basert`, `/opt/homebrew/bin/basert`, or `/usr/local/bin/basert`)
+- macOS 26+, Xcode 26+, Apple silicon for MLX
+- Optional: the `edge0` CLI (`pip install` from [Edge0-AI/edge0](https://github.com/Edge0-AI/edge0); auto-detected on `PATH` or as `python3 -m edge0`). Checkpoints via `$EDGE0_8B_MODEL` / `$EDGE0_35B_MODEL`, `~/models/edge0-*`, or a Hub download.
+- Optional: the `basert` CLI (auto-detected at `~/.basert/basert`, `/opt/homebrew/bin/basert`, or `/usr/local/bin/basert`)
+- At least one of Edge0, BaseRT, or MLX is enough to run. MLX is compiled into the app.
 - Dictation asks for microphone and speech recognition access on first use. Under the hardened
   runtime this also needs the `com.apple.security.device.audio-input` entitlement, which is in
   `BaseChat.entitlements`.
@@ -64,7 +88,7 @@ to a prompt and asks again from there.
 ## Run
 
 A built app is in `dist/BaseChat.app` — double-click it, or drag it to `/Applications`.
-`BaseChat-0.2.1.dmg` is the distributable: a 640×400 install window with the app, an Applications
+`BaseChat-0.4.0.dmg` is the distributable: a 640×400 install window with the app, an Applications
 alias, and an arrow between them.
 
 ## Packaging
@@ -100,7 +124,20 @@ The background is generated by `packaging/make-background.swift` (1× and 2× co
 open BaseChat.xcodeproj
 ```
 
-Press ⌘R. No Swift package dependencies, no signing team needed (signs to run locally).
+Press ⌘R. The first build resolves [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm)
+and Hugging Face packages. Compiling MLX needs Apple’s **Metal toolchain** (the `metal`
+compiler). That is a build-time Xcode component — it is not required to *run* a built
+`BaseChat.app`, and it cannot be shipped inside the app (Apple does not allow
+redistributing the toolchain; the compiled `.metallib` kernels are already inside the
+MLX framework once the app has been built).
+
+```
+xcodebuild -downloadComponent MetalToolchain
+```
+
+Xcode 26 also offers the download under Settings → Platforms. After that, a normal
+⌘R or the Release recipe below is enough. No signing team needed for local runs
+(signs to run locally).
 To rebuild the standalone app:
 
 ```
@@ -122,9 +159,11 @@ codesign --force --deep --sign - dist/BaseChat.app
 | ⌘I | Italic |
 | ⇧ while resizing | Keep a shape's proportions |
 | ↩ (in the search field) | Jump to the next match, wrapping at the end |
+| ⌘Z | Undo delete chat or delete markup |
 | ⌫ | Delete the selected marks, or the selected chats |
 | ⇧/⌘-click | Select several chats |
 | ⇧-click on a mark | Add it to the selection, or take it back out |
+| double-click a sidebar title | Rename the chat |
 
 ## Layout
 
@@ -135,9 +174,14 @@ codesign --force --deep --sign - dist/BaseChat.app
 | `Dictation.swift` | Microphone capture through `SpeechAnalyzer` |
 | `PDFExport.swift` | Sheets to vector PDF, notes to PDF annotations |
 | `PagesHandoff.swift` | Markdown to styled RTF for Apple Pages |
-| `Search.swift` | Matching, snippets, the toolbar field, and the sidebar row |
-| `MarkdownView.swift` | The Markdown parser and renderer |
-| `Runtime.swift` | The `basert` CLI: model list, downloads, and the local server |
+| `Search.swift` | Matching, snippets, the toolbar field, and the sidebar row (rename lives here too) |
+| `MarkdownView.swift` | The Markdown parser and renderer, including cross-line text selection |
+| `Runtime.swift` | Engine pick (Edge0 → BaseRT → MLX), CLI servers, and the shared completion path |
+| `Edge0Engine.swift` | edge0 CLI discovery, the two MoE tiers, and checkpoint paths |
+| `MLXEngine.swift` | In-process MLX load, Hub download, KV-cached chat sessions, and token stream |
+| `Generation.swift` | Reasoning split (`<think>`), context trim, and completion stats |
+| `ChatStore.swift` | Persistence, rename, and undo for chats and markup |
+| `LocalServer.swift` | Fixed-port OpenAI HTTP front, with a required key when bound beyond loopback |
 
 ## Licence
 

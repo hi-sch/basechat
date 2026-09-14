@@ -3,7 +3,7 @@
 # NOTARY_ISSUER is set (see README).
 set -euo pipefail
 
-VERSION="${VERSION:-0.2.1}"
+VERSION="${VERSION:-0.4.0}"
 APP="dist/BaseChat.app"
 VOL="BaseChat $VERSION"
 DMG="BaseChat-$VERSION.dmg"
@@ -16,10 +16,43 @@ cd "$(dirname "$0")/.."
 
 STAGE=$(mktemp -d)
 RW=$(mktemp -u).dmg
-trap 'rm -rf "$STAGE" "$RW"' EXIT
+MOUNT=""
+
+detach_basechat_volumes() {
+  local vol
+  # Leftover RW images (including "BaseChat 0.2.1 1") hide the next attach
+  # and make Finder's `tell disk` fail with -1728.
+  for vol in /Volumes/BaseChat*; do
+    [ -e "$vol" ] || continue
+    echo "    detaching $vol"
+    hdiutil detach "$vol" -force >/dev/null 2>&1 || true
+  done
+}
+
+wait_for_finder_disk() {
+  local name="$1"
+  local i seen
+  for i in $(seq 1 40); do
+    seen=$(osascript -e "tell application \"Finder\" to exists disk \"$name\"" 2>/dev/null || true)
+    [ "$seen" = "true" ] && return 0
+    sleep 0.25
+  done
+  echo "error: Finder never saw disk \"$name\" (error -1728)" >&2
+  osascript -e 'tell application "Finder" to get name of every disk' >&2 || true
+  return 1
+}
+
+cleanup() {
+  if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
+    hdiutil detach "$MOUNT" -force >/dev/null 2>&1 || true
+  fi
+  rm -rf "$STAGE"
+  [ -n "$RW" ] && rm -f "$RW"
+}
+trap cleanup EXIT
 
 echo "==> staging"
-hdiutil detach "/Volumes/$VOL" >/dev/null 2>&1 || true
+detach_basechat_volumes
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 mkdir -p "$STAGE/.background"
@@ -27,8 +60,12 @@ cp packaging/dmg-background.tiff "$STAGE/.background/bg.tiff"
 
 echo "==> creating writable image"
 hdiutil create -srcfolder "$STAGE" -volname "$VOL" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
-hdiutil attach "$RW" -nobrowse -noverify >/dev/null
+# Do not pass -nobrowse: Finder then cannot `tell disk` and icon layout
+# fails with -1728 ("Can't get disk").
+hdiutil attach "$RW" -readwrite -noverify -noautoopen >/dev/null
 MOUNT="/Volumes/$VOL"
+[ -d "$MOUNT" ] || { echo "error: expected mount $MOUNT"; exit 1; }
+wait_for_finder_disk "$VOL"
 
 echo "==> arranging window"
 # Finder can snap icons on the first pass, so set, settle, then confirm.
@@ -67,7 +104,8 @@ AS
 done
 
 sync
-hdiutil detach "$MOUNT" >/dev/null
+hdiutil detach "$MOUNT"
+MOUNT=""
 
 echo "==> compressing"
 rm -f "$DMG"

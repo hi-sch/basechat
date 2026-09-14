@@ -57,6 +57,10 @@ final class LocalServer {
         error = nil
         requests = 0
         lastRequest = ""
+        if !settings.loopbackOnly, settings.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            error = "A key is required when the server is reachable on the network."
+            return
+        }
         persist()
 
         guard settings.port > 0, settings.port < 65536,
@@ -172,9 +176,133 @@ final class LocalServer {
             // open it. Answer with what lives underneath rather than a 404.
             await Self.reply(status: 200, json: Self.index, on: connection)
         case (_, let endpoint) where endpoint.hasPrefix("/v1/"):
-            await proxy(request, path: endpoint, on: connection)
+            if runtime?.engine == .mlx {
+                await serveMLX(request, path: endpoint, on: connection)
+            } else {
+                await proxy(request, path: endpoint, on: connection)
+            }
         default:
             await Self.reply(status: 404, json: Self.problem("No such endpoint."), on: connection)
+        }
+    }
+
+    /// OpenAI chat completions against the in-process MLX model.
+    private func serveMLX(_ request: Request, path: String, on connection: NWConnection) async {
+        guard let runtime, runtime.status.isReady else {
+            await Self.reply(status: 503, json: Self.problem("No model is running in BaseChat."),
+                             on: connection)
+            return
+        }
+
+        if request.method == "GET", path == "/v1/models" || path == "/v1/models/" {
+            let id = runtime.selectedModel ?? "local-model"
+            await Self.reply(status: 200,
+                             json: #"{"object":"list","data":[{"id":"\#(Self.escape(id))","object":"model"}]}"#,
+                             on: connection)
+            return
+        }
+
+        guard request.method == "POST",
+              path == "/v1/chat/completions" || path == "/v1/completions"
+        else {
+            await Self.reply(status: 404, json: Self.problem("No such endpoint."), on: connection)
+            return
+        }
+
+        struct Body: Decodable {
+            struct Turn: Decodable {
+                let role: String
+                let content: String?
+            }
+            let messages: [Turn]?
+            let prompt: String?
+            let stream: Bool?
+            let temperature: Double?
+            let top_p: Double?
+            let top_k: Int?
+            let max_tokens: Int?
+            let frequency_penalty: Double?
+        }
+
+        guard let parsed = try? JSONDecoder().decode(Body.self, from: request.body) else {
+            await Self.reply(status: 400, json: Self.problem("Could not read the request body."),
+                             on: connection)
+            return
+        }
+
+        var history: [Message] = []
+        if let messages = parsed.messages {
+            for turn in messages {
+                let text = turn.content ?? ""
+                if turn.role == "system" { continue }
+                if turn.role == "assistant" {
+                    history.append(Message(role: .assistant, text: text))
+                } else {
+                    history.append(Message(role: .user, text: text))
+                }
+            }
+        } else if let prompt = parsed.prompt {
+            history = [Message(role: .user, text: prompt)]
+        }
+
+        let system = parsed.messages?
+            .first { $0.role == "system" }?.content
+            ?? UserDefaults.standard.string(forKey: "systemPrompt")
+            ?? ""
+        let temperature = parsed.temperature
+            ?? (UserDefaults.standard.object(forKey: "temperature") as? Double ?? 0.7)
+        let topP = parsed.top_p
+            ?? (UserDefaults.standard.object(forKey: "topP") as? Double ?? 0.9)
+        let topK = parsed.top_k
+            ?? (UserDefaults.standard.object(forKey: "topK") as? Int ?? 40)
+        let maxTokens = parsed.max_tokens
+            ?? (UserDefaults.standard.object(forKey: "maxTokens") as? Int ?? 4096)
+        let frequencyPenalty = parsed.frequency_penalty
+            ?? (UserDefaults.standard.object(forKey: "frequencyPenalty") as? Double ?? 0)
+        let stream = parsed.stream ?? false
+        let model = runtime.selectedModel ?? "local-model"
+
+        if stream {
+            await Self.send(Data(Self.head(status: 200, type: "text/event-stream").utf8),
+                            on: connection)
+            do {
+                _ = try await runtime.complete(
+                    history: history,
+                    systemPrompt: system,
+                    temperature: temperature,
+                    topP: topP,
+                    topK: topK,
+                    maxTokens: maxTokens,
+                    frequencyPenalty: frequencyPenalty
+                ) { delta in
+                    let payload = #"{"id":"chatcmpl-local","object":"chat.completion.chunk","model":"\#(Self.escape(model))","choices":[{"index":0,"delta":{"content":"\#(Self.escape(delta))"}}]}"#
+                    await Self.send(Data("data: \(payload)\n\n".utf8), on: connection)
+                }
+                await Self.send(Data("data: [DONE]\n\n".utf8), on: connection, close: true)
+            } catch {
+                await Self.send(Data("data: \(Self.problem(error.localizedDescription))\n\n".utf8),
+                                on: connection, close: true)
+            }
+        } else {
+            var text = ""
+            do {
+                _ = try await runtime.complete(
+                    history: history,
+                    systemPrompt: system,
+                    temperature: temperature,
+                    topP: topP,
+                    topK: topK,
+                    maxTokens: maxTokens,
+                    frequencyPenalty: frequencyPenalty
+                ) { delta in
+                    text += delta
+                }
+                let json = #"{"id":"chatcmpl-local","object":"chat.completion","model":"\#(Self.escape(model))","choices":[{"index":0,"message":{"role":"assistant","content":"\#(Self.escape(text))"},"finish_reason":"stop"}]}"#
+                await Self.reply(status: 200, json: json, on: connection)
+            } catch {
+                await Self.reply(status: 500, json: Self.problem(error.localizedDescription),
+                                 on: connection)
+            }
         }
     }
 
@@ -187,10 +315,13 @@ final class LocalServer {
             return
         }
 
-        var call = URLRequest(url: runtime.apiURL.appendingPathComponent(String(path.dropFirst())))
+        let url = runtime.apiURL.appending(path: String(path.dropFirst()))
+        var call = URLRequest(url: url)
         call.httpMethod = request.method
         call.timeoutInterval = 600
-        call.setValue("Bearer \(runtime.apiToken)", forHTTPHeaderField: "Authorization")
+        if !runtime.apiToken.isEmpty {
+            call.setValue("Bearer \(runtime.apiToken)", forHTTPHeaderField: "Authorization")
+        }
         call.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !request.body.isEmpty { call.httpBody = request.body }
 
@@ -253,7 +384,7 @@ final class LocalServer {
     /// what it carries.
     private static let index = """
     {"object":"list","base_url":"this URL","endpoints":\
-    ["/v1/models","/v1/chat/completions","/v1/completions","/v1/embeddings"],\
+    ["/v1/models","/v1/chat/completions","/v1/completions"],\
     "served_by":"BaseChat"}
     """
 
@@ -261,10 +392,29 @@ final class LocalServer {
         #"{"error":{"message":"\#(escape(message))","type":"basechat_local_server"}}"#
     }
 
+    /// JSON string escaping. Newlines must survive as `\n`: flattening them
+    /// to spaces turned streamed Markdown into one unformatted run-on line.
     private static func escape(_ text: String) -> String {
-        text.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: " ")
+        var out = ""
+        out.reserveCapacity(text.count + 16)
+        for character in text {
+            switch character {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if let first = character.unicodeScalars.first, first.value < 0x20 {
+                    for scalar in character.unicodeScalars where scalar.value < 0x20 {
+                        out += String(format: "\\u%04x", scalar.value)
+                    }
+                } else {
+                    out.append(character)
+                }
+            }
+        }
+        return out
     }
 
     private static func reason(_ status: Int) -> String {
@@ -274,6 +424,7 @@ final class LocalServer {
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
         case 404: return "Not Found"
+        case 500: return "Internal Server Error"
         case 502: return "Bad Gateway"
         case 503: return "Service Unavailable"
         default: return "OK"
@@ -397,8 +548,8 @@ struct LocalServerSheet: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 Text("Serves the loaded model over HTTP in the OpenAI format, so a coding "
-                     + "agent can point at one fixed address instead of the port BaseRT "
-                     + "happened to pick. The window is put aside while it runs.")
+                     + "agent can point at one fixed address. Works with Edge0, BaseRT, "
+                     + "and in-process MLX. The window is put aside while it runs.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -425,6 +576,12 @@ struct LocalServerSheet: View {
                                isOn: $server.settings.loopbackOnly)
                             .disabled(server.isRunning)
                     }
+                }
+                if !server.settings.loopbackOnly {
+                    Text("A bearer key is required when other machines can reach this endpoint.")
+                        .font(.caption)
+                        .foregroundStyle(server.settings.token.trimmingCharacters(in: .whitespaces).isEmpty
+                                         ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
                 }
 
                 Divider()
@@ -529,6 +686,8 @@ struct LocalServerSheet: View {
                 Button("Start Server") { server.start(runtime: runtime) }
                     .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
+                    .disabled(!server.settings.loopbackOnly
+                              && server.settings.token.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(16)

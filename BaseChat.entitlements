@@ -5,5 +5,11 @@
 	<!-- Hardened runtime blocks the microphone unless the app asks for it. -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
+	<!-- Hugging Face downloads for MLX weights. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Metal JIT for MLX kernels. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
 </dict>
 </plist>

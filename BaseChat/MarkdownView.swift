@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Blocks
@@ -75,12 +76,20 @@ enum MarkdownParser {
             flushQuote()
         }
 
-        let lines = source.components(separatedBy: .newlines)
+        let lines = normalize(source).components(separatedBy: "\n")
         var index = 0
 
         while index < lines.count {
             let line = lines[index]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // One-line fence: ```python print("hi") ```
+            if let fenced = oneLineFence(trimmed) {
+                flushAll()
+                blocks.append(.code(language: fenced.language, code: fenced.code))
+                index += 1
+                continue
+            }
 
             // Fenced code — an unterminated fence still renders while streaming.
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
@@ -96,6 +105,22 @@ enum MarkdownParser {
                 }
                 index += 1
                 blocks.append(.code(language: language, code: body.joined(separator: "\n")))
+                continue
+            }
+
+            if trimmed.lowercased().hasPrefix("<pre") {
+                flushAll()
+                var body: [String] = []
+                var current = trimmed
+                while true {
+                    body.append(current)
+                    if current.lowercased().contains("</pre>") { break }
+                    index += 1
+                    guard index < lines.count else { break }
+                    current = lines[index]
+                }
+                index += 1
+                blocks.append(.code(language: "", code: htmlCodeBody(body.joined(separator: "\n"))))
                 continue
             }
 
@@ -170,6 +195,31 @@ enum MarkdownParser {
                 continue
             }
 
+            // Indented code (4 spaces / tab). CommonMark only starts this after
+            // a blank line, which already flushed the paragraph.
+            if paragraph.isEmpty, list.isEmpty, indentWidth(line) >= 4 {
+                flushQuote()
+                var body: [String] = []
+                while index < lines.count {
+                    let current = lines[index]
+                    if current.trimmingCharacters(in: .whitespaces).isEmpty {
+                        if index + 1 < lines.count, indentWidth(lines[index + 1]) >= 4 {
+                            body.append("")
+                            index += 1
+                            continue
+                        }
+                        break
+                    }
+                    guard indentWidth(current) >= 4 else { break }
+                    body.append(dropIndent(current, 4))
+                    index += 1
+                }
+                if !body.isEmpty {
+                    blocks.append(.code(language: "", code: body.joined(separator: "\n")))
+                    continue
+                }
+            }
+
             flushList()
             flushQuote()
             paragraph.append(trimmed)
@@ -204,7 +254,101 @@ enum MarkdownParser {
                              marker: .number(number),
                              text: String(trimmed[trimmed.index(dot, offsetBy: 2)...]))
         }
+        if let paren = trimmed.firstIndex(of: ")"),
+           trimmed.distance(from: trimmed.startIndex, to: paren) <= 2,
+           let number = Int(trimmed[trimmed.startIndex..<paren]),
+           trimmed[paren...].hasPrefix(") ") {
+            return ListEntry(indent: indent,
+                             marker: .number(number),
+                             text: String(trimmed[trimmed.index(paren, offsetBy: 2)...]))
+        }
         return nil
+    }
+
+    /// Models sometimes emit a fence on one line instead of wrapping the body.
+    private static func oneLineFence(_ trimmed: String) -> (language: String, code: String)? {
+        guard trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") else { return nil }
+        let mark = trimmed.first!
+        var ticks = 0
+        var cursor = trimmed.startIndex
+        while cursor < trimmed.endIndex, trimmed[cursor] == mark {
+            ticks += 1
+            cursor = trimmed.index(after: cursor)
+        }
+        guard ticks >= 3 else { return nil }
+        let close = String(repeating: String(mark), count: ticks)
+        let rest = String(trimmed[cursor...])
+        guard let closeRange = rest.range(of: close, options: .backwards),
+              closeRange.lowerBound > rest.startIndex else { return nil }
+        let inner = rest[..<closeRange.lowerBound].trimmingCharacters(in: .whitespaces)
+        guard !inner.isEmpty else { return nil }
+        if let space = inner.firstIndex(of: " ") {
+            let language = String(inner[..<space])
+            let code = inner[inner.index(after: space)...].trimmingCharacters(in: .whitespaces)
+            if language.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "_" }),
+               !code.isEmpty {
+                return (language, code)
+            }
+        }
+        return ("", inner)
+    }
+
+    private static func indentWidth(_ line: String) -> Int {
+        var width = 0
+        for character in line {
+            if character == " " { width += 1 }
+            else if character == "\t" { width += 4 }
+            else { break }
+        }
+        return width
+    }
+
+    private static func dropIndent(_ line: String, _ width: Int) -> String {
+        var remaining = width
+        var index = line.startIndex
+        while index < line.endIndex, remaining > 0 {
+            if line[index] == " " {
+                remaining -= 1
+                index = line.index(after: index)
+            } else if line[index] == "\t" {
+                remaining -= 4
+                index = line.index(after: index)
+            } else {
+                break
+            }
+        }
+        return String(line[index...])
+    }
+
+    private static func htmlCodeBody(_ raw: String) -> String {
+        var text = raw
+        if let open = text.range(of: ">", options: []) {
+            text = String(text[open.upperBound...])
+        }
+        if let close = text.range(of: "</pre>", options: [.caseInsensitive, .backwards]) {
+            text = String(text[..<close.lowerBound])
+        }
+        text = text.replacingOccurrences(of: "</code>", with: "", options: .caseInsensitive)
+        if let open = text.range(of: "<code", options: .caseInsensitive),
+           let end = text[open.lowerBound...].range(of: ">") {
+            text = String(text[end.upperBound...])
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Expand the line-break spellings small MLX models often emit instead of
+    /// real newlines, so fences and lists actually parse.
+    private static func normalize(_ source: String) -> String {
+        var text = source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "<br />", with: "\n", options: .caseInsensitive)
+            .replacingOccurrences(of: "<br/>", with: "\n", options: .caseInsensitive)
+            .replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
+        if !text.contains(where: { $0 == "\n" }), text.contains("\\n") {
+            text = text.replacingOccurrences(of: "\\n", with: "\n")
+        }
+        return text
     }
 
     private static func isTableSeparator(_ line: String) -> Bool {
@@ -235,11 +379,32 @@ enum MarkdownParser {
             )
             let parsed = (try? AttributedString(markdown: source, options: options))
                 ?? AttributedString(source)
-            remember(source, parsed)
-            return parsed
+            let selectable = Self.crossLineSelection(parsed)
+            remember(source, selectable)
+            return selectable
         }()
         guard !highlight.isEmpty else { return Text(attributed) }
         return Text(SearchIndex.emphasise(attributed, term: highlight))
+    }
+
+    /// SwiftUI `Text` selection cannot cross a paragraph break (`\n`). Line
+    /// Separator (U+2028) still wraps visually but stays one paragraph, so a
+    /// drag can run through a whole message that contains returns.
+    static func crossLineSelection(_ attributed: AttributedString) -> AttributedString {
+        let ns = NSMutableAttributedString(attributedString: NSAttributedString(attributed))
+        for needle in ["\r\n", "\n", "\r"] {
+            let range = NSRange(location: 0, length: ns.length)
+            ns.mutableString.replaceOccurrences(
+                of: needle, with: "\u{2028}", options: [], range: range)
+        }
+        return AttributedString(ns)
+    }
+
+    static func crossLineSelection(_ string: String) -> String {
+        string
+            .replacingOccurrences(of: "\r\n", with: "\u{2028}")
+            .replacingOccurrences(of: "\n", with: "\u{2028}")
+            .replacingOccurrences(of: "\r", with: "\u{2028}")
     }
 
     @MainActor private static var spans: [String: AttributedString] = [:]
@@ -272,12 +437,80 @@ struct MarkdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10 * ratio) {
-            ForEach(Array(MarkdownParser.parse(text).enumerated()), id: \.offset) { _, block in
-                view(for: block)
+            ForEach(Array(pieces.enumerated()), id: \.offset) { _, piece in
+                switch piece {
+                case .flow(let text):
+                    text.fixedSize(horizontal: false, vertical: true)
+                case .block(let block):
+                    view(for: block)
+                }
             }
         }
         .font(.system(size: baseSize))
         .textSelection(.enabled)
+        // SwiftUI only swaps in the I-beam directly over glyphs, if at all —
+        // message text should feel like text everywhere, code and tables too.
+        .onHover { inside in
+            if inside { NSCursor.iBeam.set() } else { NSCursor.arrow.set() }
+        }
+    }
+
+    /// Headings and paragraphs concatenate into one `Text`, so a selection can
+    /// run across blank lines instead of dying at each paragraph view.
+    private enum Piece {
+        case flow(Text)
+        case block(MarkdownBlock)
+    }
+
+    private var pieces: [Piece] {
+        var result: [Piece] = []
+        var flow: Text?
+        let breakBetween = Text(MarkdownParser.crossLineSelection("\n\n"))
+        func flush() {
+            if let flow { result.append(.flow(flow)) }
+            flow = nil
+        }
+        for block in MarkdownParser.parse(text) {
+            if let run = flowText(for: block) {
+                flow = flow.map { $0 + breakBetween + run } ?? run
+            } else {
+                flush()
+                result.append(.block(block))
+            }
+        }
+        flush()
+        return result
+    }
+
+    private func flowText(for block: MarkdownBlock) -> Text? {
+        switch block {
+        case .heading(let level, let text):
+            return MarkdownParser.inline(text, highlight: highlight)
+                .font(.system(size: Self.headingSizes[min(max(level, 1), 6) - 1] * ratio, weight: .semibold))
+        case .paragraph(let text):
+            return MarkdownParser.inline(text, highlight: highlight)
+        case .list(let entries):
+            var run: Text?
+            let breakLine = Text("\u{2028}")
+            for entry in entries {
+                let mark: Text = {
+                    switch entry.marker {
+                    case .bullet: return Text(entry.indent == 0 ? "•  " : "◦  ")
+                    case .number(let value): return Text("\(value).  ")
+                    case .task(let done): return Text(done ? "☑  " : "☐  ")
+                    }
+                }()
+                let indent = String(repeating: "    ", count: entry.indent)
+                let line = Text(indent) + mark + MarkdownParser.inline(entry.text, highlight: highlight)
+                run = run.map { $0 + breakLine + line } ?? line
+            }
+            return run
+        case .quote(let lines):
+            return MarkdownParser.inline(lines.joined(separator: "\n"), highlight: highlight)
+                .foregroundStyle(.secondary)
+        case .code, .table, .rule:
+            return nil
+        }
     }
 
     private static let headingSizes: [CGFloat] = [22, 19, 17, 15, 14, 13]
@@ -285,41 +518,12 @@ struct MarkdownView: View {
     @ViewBuilder
     private func view(for block: MarkdownBlock) -> some View {
         switch block {
-        case .heading(let level, let text):
-            MarkdownParser.inline(text, highlight: highlight)
-                .font(.system(size: Self.headingSizes[min(max(level, 1), 6) - 1] * ratio, weight: .semibold))
-                .padding(.top, 2 * ratio)
-
-        case .paragraph(let text):
-            MarkdownParser.inline(text, highlight: highlight)
-                .fixedSize(horizontal: false, vertical: true)
-
-        case .list(let entries):
-            VStack(alignment: .leading, spacing: 5 * ratio) {
-                ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
-                    HStack(alignment: .firstTextBaseline, spacing: 8 * ratio) {
-                        marker(for: entry)
-                        MarkdownParser.inline(entry.text, highlight: highlight)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.leading, CGFloat(entry.indent) * 18 * ratio)
-                }
-            }
-
-        case .quote(let lines):
-            HStack(alignment: .top, spacing: 10 * ratio) {
-                Capsule().fill(.tint.opacity(0.5)).frame(width: 3 * ratio)
-                MarkdownParser.inline(lines.joined(separator: "\n"), highlight: highlight)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+        case .heading, .paragraph, .list, .quote:
+            EmptyView()
         case .code(let language, let code):
             CodeBlock(language: language, code: code, baseSize: baseSize, document: document)
-
         case .table(let header, let rows):
             TableBlock(header: header, rows: rows, baseSize: baseSize, document: document)
-
         case .rule:
             Divider().padding(.vertical, 2)
         }
@@ -414,7 +618,7 @@ struct CodeBlock: View {
             Divider().opacity(0.4)
 
             Scrollable(document: document) {
-                Text(code)
+                Text(MarkdownParser.crossLineSelection(code))
                     .font(.system(size: baseSize - 1, design: .monospaced))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)

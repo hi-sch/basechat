@@ -129,7 +129,10 @@ final class Dictation {
         stream?.finish()
         stream = nil
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
-        results?.cancel()
+        // Let the results task drain — cancelling here could drop the final
+        // phrase the analyzer just committed. The stream is finished, so the
+        // task ends on its own.
+        await results?.value
         results = nil
         analyzer = nil
         transcriber = nil

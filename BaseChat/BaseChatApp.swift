@@ -62,6 +62,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store?.flush()
             localServer?.stop()
             runtime?.stopServer()
+            runtime?.mlx.unload()
+            ProcessTree.reapOrphans()
         }
     }
 }

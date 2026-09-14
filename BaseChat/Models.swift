@@ -15,17 +15,36 @@ struct Message: Identifiable, Codable, Hashable {
     /// `org/name:variant` of the model that produced this turn. Assistant only,
     /// so switching models mid-chat leaves the old answers labelled with the old id.
     var model: String?
+    /// Hidden chain-of-thought, folded under the answer.
+    var reasoning: String?
+    var tokensPerSecond: Double?
+    /// Set when older turns were dropped so the prompt would fit.
+    var contextTrimmed: Bool = false
 
-    init(id: UUID = UUID(), role: Role, text: String, created: Date = Date(), model: String? = nil) {
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        text: String,
+        created: Date = Date(),
+        model: String? = nil,
+        reasoning: String? = nil,
+        tokensPerSecond: Double? = nil,
+        contextTrimmed: Bool = false
+    ) {
         self.id = id
         self.role = role
         self.text = text
         self.created = created
         self.model = model
+        self.reasoning = reasoning
+        self.tokensPerSecond = tokensPerSecond
+        self.contextTrimmed = contextTrimmed
     }
 
-    // Hand-written so chats saved before `created`/`model` existed still decode.
-    enum CodingKeys: String, CodingKey { case id, role, text, created, model }
+    // Hand-written so chats saved before the extra fields existed still decode.
+    enum CodingKeys: String, CodingKey {
+        case id, role, text, created, model, reasoning, tokensPerSecond, contextTrimmed
+    }
 
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
@@ -34,15 +53,19 @@ struct Message: Identifiable, Codable, Hashable {
         text = try box.decode(String.self, forKey: .text)
         created = try box.decodeIfPresent(Date.self, forKey: .created) ?? Date()
         model = try box.decodeIfPresent(String.self, forKey: .model)
+        reasoning = try box.decodeIfPresent(String.self, forKey: .reasoning)
+        tokensPerSecond = try box.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        contextTrimmed = try box.decodeIfPresent(Bool.self, forKey: .contextTrimmed) ?? false
     }
 
-    /// `2:32 PM`
+    /// Short time in the user's locale — `2:32 PM` or `14:32`.
     var timeLabel: String { Self.clock.string(from: created) }
 
     // Formatters are expensive to build and these run per turn, per redraw.
     private static let clock: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a"
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
         return formatter
     }()
 
@@ -238,15 +261,23 @@ struct Chat: Identifiable, Codable, Hashable {
         return Self.shortDate.string(from: date)
     }
 
-    private static let timeOfDay = Chat.formatter("HH:mm")
-    private static let weekday = Chat.formatter("EEEE")
-    private static let shortDate = Chat.formatter("dd/MM/yy")
-
-    private static func formatter(_ format: String) -> DateFormatter {
+    private static let timeOfDay: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = format
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
         return formatter
-    }
+    }()
+    private static let weekday: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEEE")
+        return formatter
+    }()
+    private static let shortDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .none
+        return formatter
+    }()
 
     /// The whole conversation as Markdown, for the copy button.
     var transcript: String {
@@ -274,11 +305,17 @@ struct ModelInfo: Codable, Identifiable, Hashable {
     /// Absolute path of the `.base` file (present for installed models).
     var path: String?
 
-    /// `org/name:variant` — what `basert serve` and the API expect.
-    var id: String { "\(modelID):\(variant)" }
+    /// `org/name:variant` for BaseRT; Hub / tier id for MLX and Edge0.
+    var id: String {
+        if sourceKind == "mlx" || sourceKind == "edge0" { return modelID }
+        return "\(modelID):\(variant)"
+    }
 
     var displayName: String {
-        modelID.split(separator: "/").last.map(String.init) ?? modelID
+        if sourceKind == "edge0", let name = Edge0Engine.tier(matching: modelID)?.name {
+            return name
+        }
+        return modelID.split(separator: "/").last.map(String.init) ?? modelID
     }
 
     var sizeText: String {

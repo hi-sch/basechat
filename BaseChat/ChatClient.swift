@@ -41,11 +41,13 @@ struct ChatClient {
     }
 
     /// Streams assistant text. `onDelta` is called on the main actor for every token.
-    func send(_ history: [Message], onDelta: @escaping @MainActor (String) -> Void) async throws {
-        var request = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
+    func send(_ history: [Message], onDelta: @escaping @MainActor (String) async -> Void) async throws {
+        var request = URLRequest(url: baseURL.appending(path: "v1/chat/completions"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         request.timeoutInterval = 600
         var turns = history.map { RequestBody.Turn(role: $0.role.rawValue, content: $0.text) }
         let trimmedSystem = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -66,11 +68,12 @@ struct ChatClient {
         )
 
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        try Task.checkCancellation()
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else {
             var body = ""
             for try await line in bytes.lines { body += line }
-            throw APIError(message: "HTTP \(code): \(body.isEmpty ? "no response body" : body)")
+            throw APIError(message: Self.explain(status: code, body: body))
         }
 
         for try await line in bytes.lines {
@@ -81,7 +84,23 @@ struct ChatClient {
                   let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
                   let text = chunk.choices?.first?.delta?.content, !text.isEmpty
             else { continue }
-            await MainActor.run { onDelta(text) }
+            try Task.checkCancellation()
+            await onDelta(text)
         }
+    }
+
+    private static func explain(status: Int, body: String) -> String {
+        struct Envelope: Decodable {
+            struct ErrorBody: Decodable { let message: String? }
+            let error: ErrorBody?
+            let message: String?
+        }
+        if let data = body.data(using: .utf8),
+           let envelope = try? JSONDecoder().decode(Envelope.self, from: data) {
+            if let message = envelope.error?.message ?? envelope.message, !message.isEmpty {
+                return "HTTP \(status): \(message)"
+            }
+        }
+        return "HTTP \(status): \(body.isEmpty ? "no response body" : body)"
     }
 }

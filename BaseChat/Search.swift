@@ -111,6 +111,16 @@ enum SearchIndex {
         var total = chat.title.range(of: term, options: .caseInsensitive) != nil ? 1 : 0
         for message in chat.messages {
             total += ranges(in: message.text, term: term).count
+            if let reasoning = message.reasoning {
+                total += ranges(in: reasoning, term: term).count
+            }
+            if let model = message.model {
+                total += ranges(in: model, term: term).count
+                total += ranges(in: Message.prettyModel(model), term: term).count
+            }
+        }
+        for annotation in chat.annotations where !annotation.text.isEmpty {
+            total += ranges(in: annotation.text, term: term).count
         }
         counts[chat.id] = (chat.lastActivity, total)
         return total
@@ -122,10 +132,27 @@ enum SearchIndex {
         if let cached = snippets[chat.id], cached.stamp == chat.lastActivity { return cached.value }
         var found: [SearchHit] = []
         for message in chat.messages {
-            guard let first = ranges(in: message.text, term: term).first else { continue }
-            found.append(SearchHit(id: message.id, role: message.role,
-                                   snippet: snippet(message.text, around: first, term: term)))
+            if let first = ranges(in: message.text, term: term).first {
+                found.append(SearchHit(id: message.id, role: message.role,
+                                       snippet: snippet(message.text, around: first, term: term)))
+            } else if let reasoning = message.reasoning, let first = ranges(in: reasoning, term: term).first {
+                found.append(SearchHit(id: message.id, role: message.role,
+                                       snippet: snippet(reasoning, around: first, term: term)))
+            } else if let model = message.model,
+                      ranges(in: model, term: term).first != nil
+                        || ranges(in: Message.prettyModel(model), term: term).first != nil {
+                found.append(SearchHit(id: message.id, role: message.role,
+                                       snippet: emphasise(AttributedString(Message.prettyModel(model)), term: term)))
+            }
             if found.count == limit { break }
+        }
+        if found.count < limit {
+            for annotation in chat.annotations where !annotation.text.isEmpty {
+                guard let first = ranges(in: annotation.text, term: term).first else { continue }
+                found.append(SearchHit(id: annotation.id, role: .assistant,
+                                       snippet: snippet(annotation.text, around: first, term: term)))
+                if found.count == limit { break }
+            }
         }
         snippets[chat.id] = (chat.lastActivity, found)
         return found
@@ -328,8 +355,13 @@ struct SearchTextField: NSViewRepresentable {
 struct ChatRow: View {
     let chat: Chat
     let term: String
+    @Binding var renaming: Chat.ID?
+    @Environment(ChatStore.self) private var store
+    @Environment(\.undoManager) private var undoManager
+    @State private var draft = ""
 
     private var hits: [SearchHit] { term.isEmpty ? [] : SearchIndex.hits(chat, term: term) }
+    private var isRenaming: Bool { renaming == chat.id }
 
     private static func matchLabel(_ count: Int) -> String {
         count == 1 ? "1 match" : "\(count) matches"
@@ -337,10 +369,23 @@ struct ChatRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(term.isEmpty ? AttributedString(chat.title)
-                              : SearchIndex.emphasise(AttributedString(chat.title), term: term))
-                .font(.headline)
-                .lineLimit(1)
+            if isRenaming {
+                TextField("Title", text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(.headline)
+                    .onSubmit { commitRename() }
+                    .onAppear { draft = chat.title }
+                    .onExitCommand { renaming = nil }
+            } else {
+                Text(term.isEmpty ? AttributedString(chat.title)
+                                  : SearchIndex.emphasise(AttributedString(chat.title), term: term))
+                    .font(.headline)
+                    .lineLimit(1)
+                    .onTapGesture(count: 2) {
+                        draft = chat.title
+                        renaming = chat.id
+                    }
+            }
 
             if term.isEmpty {
                 HStack(spacing: 6) {
@@ -376,5 +421,10 @@ struct ChatRow: View {
             }
         }
         .padding(.vertical, 3)
+    }
+
+    private func commitRename() {
+        store.rename(chat.id, to: draft, undoManager: undoManager)
+        renaming = nil
     }
 }

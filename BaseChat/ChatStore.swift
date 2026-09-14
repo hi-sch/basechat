@@ -8,6 +8,8 @@ final class ChatStore {
     var chats: [Chat] = []
     /// A set so the sidebar supports ⇧/⌘ multi-select.
     var selection: Set<Chat.ID> = []
+    /// Shown in the composer when a write to `chats.json` fails.
+    var persistError: String?
 
     private let url: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -37,9 +39,11 @@ final class ChatStore {
         save()
     }
 
-    func delete(_ ids: Set<Chat.ID>) {
+    func delete(_ ids: Set<Chat.ID>, undoManager: UndoManager? = nil) {
         guard !ids.isEmpty else { return }
         let index = chats.firstIndex { ids.contains($0.id) } ?? 0
+        let removed = chats.filter { ids.contains($0.id) }
+        let previousSelection = selection
         chats.removeAll { ids.contains($0.id) }
         if chats.isEmpty {
             newChat()
@@ -47,6 +51,35 @@ final class ChatStore {
             selection = [chats[min(index, chats.count - 1)].id]
         }
         save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.restore(removed, at: index, selection: previousSelection, undoManager: undoManager)
+        }
+        undoManager?.setActionName(removed.count == 1 ? "Delete Chat" : "Delete Chats")
+    }
+
+    private func restore(_ items: [Chat], at index: Int, selection: Set<Chat.ID>, undoManager: UndoManager?) {
+        let insert = min(index, chats.count)
+        chats.insert(contentsOf: items, at: insert)
+        self.selection = selection
+        save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.delete(Set(items.map(\.id)), undoManager: undoManager)
+        }
+        undoManager?.setActionName(items.count == 1 ? "Delete Chat" : "Delete Chats")
+    }
+
+    func rename(_ id: Chat.ID, to title: String, undoManager: UndoManager? = nil) {
+        guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = trimmed.isEmpty ? "New Chat" : trimmed
+        let previous = chats[i].title
+        guard next != previous else { return }
+        chats[i].title = next
+        save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.rename(id, to: previous, undoManager: undoManager)
+        }
+        undoManager?.setActionName("Rename Chat")
     }
 
     func append(_ message: Message, to id: Chat.ID) {
@@ -60,11 +93,23 @@ final class ChatStore {
     }
 
     /// Streaming append — mutates the last assistant message in place.
-    func updateLastAssistant(in id: Chat.ID, text: String) {
+    func updateLastAssistant(
+        in id: Chat.ID,
+        text: String? = nil,
+        reasoning: String? = nil,
+        tokensPerSecond: Double? = nil,
+        contextTrimmed: Bool? = nil
+    ) {
         guard let i = chats.firstIndex(where: { $0.id == id }),
               let j = chats[i].messages.lastIndex(where: { $0.role == .assistant })
         else { return }
-        chats[i].messages[j].text = text
+        if let text { chats[i].messages[j].text = text }
+        if let reasoning {
+            let current = chats[i].messages[j].reasoning ?? ""
+            chats[i].messages[j].reasoning = current + reasoning
+        }
+        if let tokensPerSecond { chats[i].messages[j].tokensPerSecond = tokensPerSecond }
+        if let contextTrimmed { chats[i].messages[j].contextTrimmed = contextTrimmed }
         chats[i].updated = Date()
     }
 
@@ -88,10 +133,14 @@ final class ChatStore {
         return chat.annotations
     }
 
-    func add(_ annotation: Annotation, to id: Chat.ID) {
+    func add(_ annotation: Annotation, to id: Chat.ID, undoManager: UndoManager? = nil) {
         guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
         chats[i].annotations.append(annotation)
         save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.removeAnnotation(annotation.id, in: id, undoManager: undoManager)
+        }
+        undoManager?.setActionName("Add Markup")
     }
 
     func update(_ annotation: Annotation, in id: Chat.ID) {
@@ -102,14 +151,27 @@ final class ChatStore {
         save()
     }
 
-    func removeAnnotation(_ annotationID: Annotation.ID, in id: Chat.ID) {
-        guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
+    func removeAnnotation(_ annotationID: Annotation.ID, in id: Chat.ID, undoManager: UndoManager? = nil) {
+        guard let i = chats.firstIndex(where: { $0.id == id }),
+              let annotation = chats[i].annotations.first(where: { $0.id == annotationID })
+        else { return }
         chats[i].annotations.removeAll { $0.id == annotationID }
         save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.add(annotation, to: id, undoManager: undoManager)
+        }
+        undoManager?.setActionName("Delete Markup")
     }
 
     private static func title(from text: String) -> String {
-        let line = text.split(separator: "\n").first.map(String.init) ?? text
+        var line = text.split(separator: "\n").first.map(String.init) ?? text
+        line = line.trimmingCharacters(in: .whitespaces)
+        while line.hasPrefix("#") { line = String(line.dropFirst()).trimmingCharacters(in: .whitespaces) }
+        for mark in ["**", "__", "*", "_", "`"] {
+            if line.hasPrefix(mark), line.hasSuffix(mark), line.count > mark.count * 2 {
+                line = String(line.dropFirst(mark.count).dropLast(mark.count))
+            }
+        }
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         return trimmed.count > 42 ? String(trimmed.prefix(42)) + "…" : (trimmed.isEmpty ? "New Chat" : trimmed)
     }
@@ -138,8 +200,13 @@ final class ChatStore {
     }
 
     private func write() {
-        guard let data = try? JSONEncoder().encode(chats) else { return }
-        try? data.write(to: url, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(chats)
+            try data.write(to: url, options: .atomic)
+            persistError = nil
+        } catch {
+            persistError = "Could not save chats: \(error.localizedDescription)"
+        }
     }
 
     private func load() {

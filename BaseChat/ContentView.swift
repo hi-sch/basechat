@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -5,8 +6,10 @@ struct ContentView: View {
     @Environment(Runtime.self) private var runtime
     @Environment(SearchModel.self) private var search
     @Environment(LocalServer.self) private var localServer
+    @Environment(\.undoManager) private var undoManager
     @State private var showModels = false
     @State private var showLocalServer = false
+    @State private var renaming: Chat.ID?
 
     var body: some View {
         chrome
@@ -24,6 +27,9 @@ struct ContentView: View {
             }
             .background(TitlebarPin())
             .task { await runtime.bootstrap() }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                Task { await runtime.rescanEngines() }
+            }
     }
 
     private var chrome: some View {
@@ -32,12 +38,16 @@ struct ContentView: View {
         return NavigationSplitView {
             List(selection: $store.selection) {
                 ForEach(visibleChats) { chat in
-                    ChatRow(chat: chat, term: search.isActive ? search.term : "")
+                    ChatRow(chat: chat, term: search.isActive ? search.term : "",
+                            renaming: $renaming)
                         .tag(chat.id)
                         .help(chat.lastActivity.formatted(date: .abbreviated, time: .shortened))
                         .contextMenu {
+                            Button("Rename") {
+                                renaming = chat.id
+                            }
                             Button(deleteLabel(for: chat), role: .destructive) {
-                                store.delete(targets(including: chat))
+                                store.delete(targets(including: chat), undoManager: undoManager)
                             }
                         }
                 }
@@ -50,7 +60,7 @@ struct ContentView: View {
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 210, ideal: 270, max: 380)
-            .onDeleteCommand { store.delete(store.selection) }
+            .onDeleteCommand { store.delete(store.selection, undoManager: undoManager) }
             .toolbar {
                 ToolbarItem(placement: .navigation) {
                     Button { store.newChat() } label: {
@@ -93,6 +103,7 @@ struct ContentView: View {
 struct ChatView: View {
     @Environment(ChatStore.self) private var store
     @Environment(Runtime.self) private var runtime
+    @Environment(\.undoManager) private var undoManager
     @Environment(ModelSettings.self) private var settings
     @Environment(Dictation.self) private var dictation
     @Environment(AnnotationState.self) private var annotations
@@ -108,6 +119,9 @@ struct ChatView: View {
     @State private var composerHeight: CGFloat = 21
     @State private var composer = ComposerController()
     @State private var streaming: Task<Void, Never>?
+    /// The assistant turn being generated — drives the thinking fold's
+    /// expand-while-thinking / collapse-on-answer cycle.
+    @State private var streamingMessageID: Message.ID?
     @State private var errorText: String?
     @State private var copiedConversation = false
     @State private var showSettings = false
@@ -144,7 +158,10 @@ struct ChatView: View {
         }
         var found: [SearchModel.Match] = []
         for message in chat.messages {
-            let count = SearchIndex.ranges(in: message.text, term: search.term).count
+            var haystack = message.text
+            if let reasoning = message.reasoning { haystack += "\n" + reasoning }
+            if let model = message.model { haystack += "\n" + model + "\n" + Message.prettyModel(model) }
+            let count = SearchIndex.ranges(in: haystack, term: search.term).count
             for ordinal in 0..<count {
                 found.append(SearchModel.Match(message: message.id, ordinal: ordinal))
             }
@@ -163,11 +180,12 @@ struct ChatView: View {
                 layout: layout,
                 highlight: term,
                 state: annotations,
+                liveMessageID: streamingMessageID,
                 onRegenerate: regenerate,
                 onOpenInPages: openInPages,
                 onCreate: { annotation in
                     guard let id = store.currentID else { return }
-                    store.add(annotation, to: id)
+                    store.add(annotation, to: id, undoManager: undoManager)
                 },
                 onUpdate: { annotation in
                     guard let id = store.currentID else { return }
@@ -175,18 +193,34 @@ struct ChatView: View {
                 },
                 onDelete: { annotationID in
                     guard let id = store.currentID else { return }
-                    store.removeAnnotation(annotationID, in: id)
+                    store.removeAnnotation(annotationID, in: id, undoManager: undoManager)
                 },
                 focus: search.currentMatch?.message,
                 focusToken: search.jump
             )
         } else {
-            ContinuousTranscript(messages: messages,
-                                 highlight: term,
-                                 onRegenerate: regenerate,
-                                 onOpenInPages: openInPages,
-                                 focus: search.currentMatch?.message,
-                                 focusToken: search.jump)
+            ContinuousTranscript(
+                chat: store.current,
+                highlight: term,
+                state: annotations,
+                liveMessageID: streamingMessageID,
+                onRegenerate: regenerate,
+                onOpenInPages: openInPages,
+                onCreate: { annotation in
+                    guard let id = store.currentID else { return }
+                    store.add(annotation, to: id, undoManager: undoManager)
+                },
+                onUpdate: { annotation in
+                    guard let id = store.currentID else { return }
+                    store.update(annotation, in: id)
+                },
+                onDelete: { annotationID in
+                    guard let id = store.currentID else { return }
+                    store.removeAnnotation(annotationID, in: id, undoManager: undoManager)
+                },
+                focus: search.currentMatch?.message,
+                focusToken: search.jump
+            )
         }
     }
 
@@ -198,6 +232,15 @@ struct ChatView: View {
                 Text(note)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular, in: .capsule)
+                    .background(Color(nsColor: .windowBackgroundColor), in: .capsule)
+            }
+            if let error = store.persistError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)
                     .glassEffect(.regular, in: .capsule)
@@ -243,7 +286,6 @@ struct ChatView: View {
         .fixedSize()
         .frame(width: 26, height: 26)
         .padding(.bottom, 2)
-        .disabled(!runtime.status.isReady)
         .help("Text style — inserts Markdown")
     }
 
@@ -274,7 +316,7 @@ struct ChatView: View {
         .buttonStyle(.plain)
         .padding(.bottom, 2)
         .padding(.leading, -4)
-        .disabled(!runtime.status.isReady || !Dictation.isSupported)
+        .disabled(!Dictation.isSupported)
         .help(dictation.phase.isActive ? "Stop dictation" : "Dictate")
     }
 
@@ -317,7 +359,6 @@ struct ChatView: View {
         }
         .frame(minHeight: 21)
         .padding(.vertical, 3)
-        .disabled(!runtime.status.isReady)
         .onChange(of: dictation.transcript) { _, heard in
             guard dictation.phase.isActive else { return }
             let base = draftBeforeDictation.trimmingCharacters(in: .whitespaces)
@@ -351,6 +392,15 @@ struct ChatView: View {
         ToolbarItem(placement: .principal) {
             Pill {
                 Menu {
+                    Picker("Engine", selection: Binding(
+                        get: { runtime.engine },
+                        set: { next in Task { await runtime.switchEngine(to: next) } }
+                    )) {
+                        ForEach(runtime.availableEngines) { engine in
+                            Text(engine.label).tag(engine)
+                        }
+                    }
+                    Divider()
                     if runtime.installed.isEmpty {
                         Text("No models installed")
                     }
@@ -444,7 +494,7 @@ struct ChatView: View {
                 Button("Clear Markup", role: .destructive) {
                     guard let id = store.currentID else { return }
                     for annotation in store.annotations(in: id) {
-                        store.removeAnnotation(annotation.id, in: id)
+                        store.removeAnnotation(annotation.id, in: id, undoManager: undoManager)
                     }
                 }
                 .disabled(store.annotations(in: store.currentID).isEmpty)
@@ -479,14 +529,15 @@ struct ChatView: View {
     private func deleteSelectedAnnotation() {
         guard let id = store.currentID, !annotations.selected.isEmpty else { return }
         for mark in annotations.selected {
-            store.removeAnnotation(mark, in: id)
+            store.removeAnnotation(mark, in: id, undoManager: undoManager)
         }
         annotations.clearSelection()
     }
 
     private var modelLabel: String {
-        guard let id = runtime.selectedModel else { return "No model" }
-        return runtime.installed.first { $0.id == id }?.displayName ?? id
+        guard let id = runtime.selectedModel else { return runtime.engine.label }
+        let name = runtime.installed.first { $0.id == id }?.displayName ?? id
+        return "\(name) · \(runtime.engine.label)"
     }
 
     // MARK: Status
@@ -497,18 +548,34 @@ struct ChatView: View {
         case .missingBinary:
             Notice(
                 icon: "exclamationmark.triangle",
-                title: "BaseRT not found",
-                message: "Expected the `basert` CLI at ~/.basert/basert, /opt/homebrew/bin or /usr/local/bin.",
-                action: nil
+                title: "\(runtime.engine.label) not found",
+                message: runtime.engine == .edge0
+                    ? "Install the edge0 CLI (`pip install -e git+https://github.com/Edge0-AI/edge0.git#egg=edge0`) or switch engine."
+                    : "Expected the `basert` CLI at ~/.basert/basert, /opt/homebrew/bin or /usr/local/bin. MLX runs in-process with no extra install.",
+                action: runtime.availableEngines.contains(.mlx)
+                    ? ("Use MLX instead", {
+                        Task { await runtime.switchEngine(to: .mlx) }
+                        return
+                    })
+                    : nil
             )
         case .noModels:
             Notice(
                 icon: "arrow.down.circle",
                 title: "No models installed",
-                message: "Download one from the BaseRT catalog or any Hugging Face repo to start chatting.",
+                message: {
+                    switch runtime.engine {
+                    case .edge0: return "Download Edge0 8B (~4.2 GB) or Edge0 35B (~23 GB) from the catalog. They are the two tiers the edge0 runtime ships."
+                    case .mlx: return "Download an MLX model from Hugging Face — Qwen3 4B is a good start on Apple silicon."
+                    case .basert: return "Download one from the BaseRT catalog or any Hugging Face repo to start chatting."
+                    }
+                }(),
                 action: ("Browse Models", { showModels = true })
             )
         case .launching(let id):
+            if runtime.loadPhase == "Ready" {
+                EmptyView()
+            } else {
             VStack(spacing: 14) {
                 LogoMark()
                     .foregroundStyle(.tint)
@@ -521,9 +588,20 @@ struct ChatView: View {
                 Text(id)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let ram = runtime.memoryLabel {
+                    Text(ram + " GPU")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                if let speed = runtime.lastTokensPerSecond, speed > 0 {
+                    Text(String(format: "%.1f tok/s last reply", speed))
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(30)
             .glassEffect(.regular, in: .rect(cornerRadius: 22))
+            }
         case .failed(let message):
             Notice(
                 icon: "xmark.octagon",
@@ -543,6 +621,7 @@ struct ChatView: View {
         if let streaming {
             streaming.cancel()
             self.streaming = nil
+            runtime.mlx.resetSession()
             store.save()
             return
         }
@@ -563,36 +642,49 @@ struct ChatView: View {
         guard message.role == .user, runtime.status.isReady, let chatID = store.currentID else { return }
         streaming?.cancel()
         streaming = nil
+        runtime.mlx.resetSession()
         let history = store.truncate(chatID, after: message.id)
         guard !history.isEmpty else { return }
         stream(history: history, in: chatID)
     }
 
     private func stream(history: [Message], in chatID: Chat.ID) {
-        guard let model = runtime.serverModelID else { return }
+        guard runtime.status.isReady else { return }
         errorText = nil
         // Stamp the turn with the model that is answering, so switching models
         // later leaves the older answers labelled with the model that wrote them.
-        store.append(Message(role: .assistant, text: "", model: runtime.selectedModel ?? model), to: chatID)
+        let model = runtime.selectedModel ?? runtime.serverModelID
+        store.append(Message(role: .assistant, text: "", model: model), to: chatID)
+        streamingMessageID = store.chats.first { $0.id == chatID }?.messages.last?.id
 
-        let client = ChatClient(
-            baseURL: runtime.apiURL,
-            model: model,
-            apiKey: runtime.apiToken,
-            systemPrompt: settings.systemPrompt,
-            temperature: settings.temperature,
-            topP: settings.topP,
-            topK: settings.topK,
-            maxTokens: settings.maxTokens,
-            frequencyPenalty: settings.frequencyPenalty
-        )
         streaming = Task { @MainActor in
             var accumulated = ""
+            var deltas = 0
             do {
-                try await client.send(history) { delta in
-                    accumulated += delta
-                    store.updateLastAssistant(in: chatID, text: accumulated)
-                }
+                let info = try await runtime.complete(
+                    history: history,
+                    chatID: chatID,
+                    systemPrompt: settings.systemPrompt,
+                    temperature: settings.temperature,
+                    topP: settings.topP,
+                    topK: settings.topK,
+                    maxTokens: settings.maxTokens,
+                    frequencyPenalty: settings.frequencyPenalty,
+                    onDelta: { delta in
+                        accumulated += delta
+                        store.updateLastAssistant(in: chatID, text: accumulated)
+                        deltas += 1
+                        if deltas.isMultiple(of: 32) { store.save() }
+                    },
+                    onReasoning: { chunk in
+                        store.updateLastAssistant(in: chatID, reasoning: chunk)
+                    }
+                )
+                store.updateLastAssistant(
+                    in: chatID,
+                    tokensPerSecond: info.tokensPerSecond,
+                    contextTrimmed: info.trimmed
+                )
             } catch is CancellationError {
                 // Keep whatever streamed in.
             } catch {
@@ -602,6 +694,7 @@ struct ChatView: View {
                 store.updateLastAssistant(in: chatID, text: "⚠️ " + (errorText ?? "No response."))
             }
             store.save()
+            streamingMessageID = nil
             streaming = nil
         }
     }
@@ -610,41 +703,102 @@ struct ChatView: View {
 // MARK: - Continuous (non-paginated) transcript
 
 struct ContinuousTranscript: View {
-    let messages: [Message]
+    @Environment(\.colorScheme) private var appearance
+    let chat: Chat?
     let highlight: String
+    let state: AnnotationState
+    /// The assistant turn being generated — nil outside a live chat.
+    var liveMessageID: Message.ID?
     var onRegenerate: (Message) -> Void = { _ in }
     var onOpenInPages: (Message) -> Void = { _ in }
-    /// The turn holding the search hit the field is parked on, plus a token
-    /// that changes on every jump so the same turn can be revealed twice.
+    var onCreate: (Annotation) -> Void = { _ in }
+    var onUpdate: (Annotation) -> Void = { _ in }
+    var onDelete: (Annotation.ID) -> Void = { _ in }
     var focus: Message.ID?
     var focusToken: Int = 0
 
+    private var messages: [Message] { chat?.messages ?? [] }
+    private var markupLive: Bool { state.tool.isDrawing || !(chat?.annotations.isEmpty ?? true) }
+
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: Paper.rowSpacing) {
-                    ForEach(messages) { message in
-                        MessageBlock(message: message,
-                                     highlight: highlight,
-                                     onRegenerate: onRegenerate,
-                                     onOpenInPages: onOpenInPages)
-                            .id(message.id)
-                    }
+        GeometryReader { geometry in
+            let width = min(780, geometry.size.width) - 48
+            ScrollViewReader { proxy in
+                ScrollView {
+                    messageStack(width: width)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 20)
+                        .frame(maxWidth: 780, alignment: .leading)
+                        .frame(maxWidth: .infinity)
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
-                .frame(maxWidth: 780, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
-            .onChange(of: messages.last?.text) { _, _ in
-                guard let last = messages.last?.id else { return }
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(last, anchor: .bottom) }
-            }
-            .onChange(of: focusToken) { _, _ in
-                guard let focus else { return }
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(focus, anchor: .top) }
+                .onChange(of: messages.last?.text) { _, _ in
+                    guard let last = messages.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(last, anchor: .bottom) }
+                }
+                .onChange(of: focusToken) { _, _ in
+                    guard let focus else { return }
+                    withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(focus, anchor: .top) }
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private func messageStack(width: CGFloat) -> some View {
+        let content = ForEach(messages) { message in
+            MessageBlock(message: message,
+                         highlight: highlight,
+                         live: true,
+                         liveMessageID: liveMessageID,
+                         onRegenerate: onRegenerate,
+                         onOpenInPages: onOpenInPages)
+                .id(message.id)
+        }
+        if markupLive {
+            ZStack(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: Paper.rowSpacing) { content }
+                continuousMarkup(width: width)
+            }
+        } else {
+            LazyVStack(alignment: .leading, spacing: Paper.rowSpacing) { content }
+        }
+    }
+
+    private func continuousMarkup(width: CGFloat) -> some View {
+        var y: CGFloat = 0
+        var columns: [TextColumn] = []
+        let scale = max(width * 4, 1)
+        for message in messages {
+            let raw = InkMap.lines(of: message, width: width, liveMessageID: liveMessageID)
+            let lines = raw.map { line in
+                CGRect(x: line.minX / width,
+                       y: (y + line.minY) / scale,
+                       width: line.width / width,
+                       height: line.height / scale)
+            }
+            let block = raw.last.map { y + $0.maxY } ?? (y + 40)
+            columns.append(TextColumn(
+                rect: CGRect(x: 0, y: y / scale, width: 1, height: max(block - y, 40) / scale),
+                lines: lines
+            ))
+            y = block + Paper.rowSpacing
+        }
+        let height = max(y, 400)
+        return AnnotationLayer(
+            page: 0,
+            size: CGSize(width: width, height: height),
+            annotations: chat?.annotations ?? [],
+            state: state,
+            columns: columns,
+            live: true,
+            appearance: appearance,
+            scale: 1,
+            onCreate: onCreate,
+            onUpdate: onUpdate,
+            onDelete: onDelete
+        )
+        .frame(width: width, height: height, alignment: .topLeading)
+        .allowsHitTesting(state.tool.isDrawing || !state.selected.isEmpty)
     }
 }
 
@@ -655,10 +809,21 @@ struct MessageBlock: View {
     var highlight: String = ""
     var baseSize: CGFloat = 13
     var document = false
+    /// On screen (paper or continuous) vs. a static export. Only a live view
+    /// follows the thinking fold's expand/collapse cycle; a PDF pins it open.
+    var live = false
+    /// The assistant turn currently being generated, if any.
+    var liveMessageID: Message.ID?
     var onRegenerate: (Message) -> Void = { _ in }
     var onOpenInPages: (Message) -> Void = { _ in }
 
     private var ratio: CGFloat { baseSize / 13 }
+
+    /// True only while this turn is the one streaming and no answer text has
+    /// arrived yet — i.e. while the model is still thinking.
+    private var isThinking: Bool {
+        live && message.id == liveMessageID && message.text.isEmpty
+    }
 
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 3 * ratio) {
@@ -685,12 +850,30 @@ struct MessageBlock: View {
             }
         case .assistant:
             HStack {
-                Group {
+                VStack(alignment: .leading, spacing: 8 * ratio) {
+                    if let reasoning = message.reasoning, !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        ThinkingFold(
+                            text: reasoning,
+                            highlight: highlight,
+                            baseSize: baseSize,
+                            document: document,
+                            live: live,
+                            streaming: isThinking
+                        )
+                    }
                     if message.text.isEmpty {
-                        ProgressView().controlSize(.small)
+                        if live && message.id == liveMessageID,
+                           message.reasoning?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                            ProgressView().controlSize(.small)
+                        }
                     } else {
                         MarkdownView(text: message.text, highlight: highlight,
                                      baseSize: baseSize, document: document)
+                    }
+                    if message.contextTrimmed {
+                        Text("Earlier turns were trimmed to fit the context window.")
+                            .font(.system(size: baseSize - 3))
+                            .foregroundStyle(.tertiary)
                     }
                 }
                 .padding(.horizontal, 12 * ratio)
@@ -698,6 +881,78 @@ struct MessageBlock: View {
                 .background(Color.primary.opacity(0.055), in: .rect(cornerRadius: 14 * ratio))
                 Spacer(minLength: 60 * ratio)
             }
+        }
+    }
+}
+
+/// Disclosure-style fold. Forced open while the answer has not started
+/// (spinner on the label). At most 16 lines, with a scrollbar; new tokens
+/// pin the scroller to the bottom like the chat transcript. Collapses when
+/// the visible reply begins. A static export (`document`, not `live`) pins
+/// it open with no scroller — the paper shows the whole trace.
+private struct ThinkingFold: View {
+    let text: String
+    var highlight: String = ""
+    var baseSize: CGFloat = 13
+    var document = false
+    var live = false
+    var streaming = false
+    @State private var expanded = true
+
+    private var fontSize: CGFloat { max(baseSize - 1, 11) }
+    private var boxHeight: CGFloat { fontSize * 1.35 * 16 }
+    private var pinnedOpen: Bool { document && !live }
+
+    private var isExpanded: Binding<Bool> {
+        Binding(
+            get: { pinnedOpen || streaming || expanded },
+            set: { newValue in
+                if !streaming { expanded = newValue }
+            }
+        )
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: isExpanded) {
+            let body = MarkdownView(text: text, highlight: highlight,
+                                    baseSize: fontSize, document: document)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if pinnedOpen {
+                body
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            body
+                            Color.clear.frame(height: 1).id("thinking-tail")
+                        }
+                    }
+                    .scrollIndicators(.visible)
+                    .frame(height: boxHeight)
+                    .onChange(of: text) { _, _ in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("thinking-tail", anchor: .bottom)
+                        }
+                    }
+                    .onAppear {
+                        proxy.scrollTo("thinking-tail", anchor: .bottom)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if streaming, !document {
+                    ProgressView().controlSize(.mini)
+                }
+                Text(streaming ? "Thinking…" : "Thinking")
+            }
+            .font(.system(size: baseSize - 2, weight: .medium))
+            .foregroundStyle(.secondary)
+        }
+        .onChange(of: streaming) { _, isStreaming in
+            if pinnedOpen { return }
+            expanded = isStreaming
         }
     }
 }
@@ -739,6 +994,11 @@ struct MessageMeta: View {
                         .font(.system(size: baseSize - 3))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                }
+                if let speed = message.tokensPerSecond, speed > 0 {
+                    Text(String(format: "· %.1f tok/s", speed))
+                        .font(.system(size: baseSize - 3))
+                        .foregroundStyle(.tertiary)
                 }
             }
         }

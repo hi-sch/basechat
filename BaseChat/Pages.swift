@@ -47,6 +47,8 @@ enum InkMap {
         let role: Message.Role
         let width: CGFloat
         let size: CGFloat
+        /// The thinking fold's expand state changes the ink — measure each.
+        let thinking: Bool
     }
 
     private static var cache: [Key: [CGRect]] = [:]
@@ -54,10 +56,16 @@ enum InkMap {
     private static let limit = 200
 
     /// One rectangle per line of text, in points from the turn's top-left.
-    static func lines(of message: Message, width: CGFloat = Paper.contentWidth) -> [CGRect] {
-        let key = Key(text: message.text, role: message.role, width: width, size: Paper.bodySize)
+    static func lines(
+        of message: Message,
+        width: CGFloat = Paper.contentWidth,
+        liveMessageID: Message.ID? = nil
+    ) -> [CGRect] {
+        let thinking = message.id == liveMessageID && message.text.isEmpty
+        let key = Key(text: message.text, role: message.role, width: width,
+                      size: Paper.bodySize, thinking: thinking)
         if let known = cache[key] { return known }
-        let found = scan(message, width: width)
+        let found = scan(message, width: width, thinking: thinking)
         cache[key] = found
         order.append(key)
         if order.count > limit {
@@ -66,11 +74,12 @@ enum InkMap {
         return found
     }
 
-    private static func scan(_ message: Message, width: CGFloat) -> [CGRect] {
+    private static func scan(_ message: Message, width: CGFloat, thinking: Bool) -> [CGRect] {
         let block = ZStack(alignment: .topLeading) {
             Color.white
             MessageBlock(message: message, highlight: "",
-                         baseSize: Paper.bodySize, document: true)
+                         baseSize: Paper.bodySize, document: true,
+                         live: true, liveMessageID: thinking ? message.id : nil)
         }
         .frame(width: width, alignment: .topLeading)
         .environment(\.colorScheme, .light)
@@ -229,14 +238,22 @@ final class DocumentLayout {
         Paper.paginate(messages, heights: heights)
     }
 
-    func needsMeasuring(_ message: Message) -> Bool {
-        measured[message.id] != message.text.hashValue || heights[message.id] == nil
+    /// The thinking fold collapsing changes a turn's height without touching
+    /// its text, so the fold state is part of the measure key.
+    static func measureKey(for message: Message, thinking: Bool) -> Int {
+        message.text.hashValue &* 31 &+ (thinking ? 1 : 0)
     }
 
-    func record(_ height: CGFloat, for message: Message) {
-        guard needsMeasuring(message) || abs((heights[message.id] ?? -1) - height) > 0.5 else { return }
+    func needsMeasuring(_ message: Message, thinking: Bool = false) -> Bool {
+        measured[message.id] != Self.measureKey(for: message, thinking: thinking)
+            || heights[message.id] == nil
+    }
+
+    func record(_ height: CGFloat, for message: Message, thinking: Bool = false) {
+        guard needsMeasuring(message, thinking: thinking)
+                || abs((heights[message.id] ?? -1) - height) > 0.5 else { return }
         heights[message.id] = height
-        measured[message.id] = message.text.hashValue
+        measured[message.id] = Self.measureKey(for: message, thinking: thinking)
     }
 }
 
@@ -248,6 +265,8 @@ struct PagedTranscript: View {
     let layout: DocumentLayout
     let highlight: String
     let state: AnnotationState
+    /// The assistant turn being generated — nil outside a live chat.
+    var liveMessageID: Message.ID?
     var onRegenerate: (Message) -> Void = { _ in }
     var onOpenInPages: (Message) -> Void = { _ in }
     var onCreate: (Annotation) -> Void = { _ in }
@@ -268,6 +287,10 @@ struct PagedTranscript: View {
 
     private var messages: [Message] { chat?.messages ?? [] }
     private var pages: [[Placement]] { layout.pages(messages) }
+
+    private func isThinking(_ message: Message) -> Bool {
+        message.id == liveMessageID && message.text.isEmpty
+    }
 
     /// Where a turn's first or last fragment sits, and on which sheet.
     private func locate(_ message: Message, last: Bool, in pages: [[Placement]]) -> (page: Int, placement: Placement)? {
@@ -306,6 +329,7 @@ struct PagedTranscript: View {
                             highlight: highlight,
                             appearance: appearance,
                             scale: scale,
+                            liveMessageID: liveMessageID,
                             onRegenerate: onRegenerate,
                             onOpenInPages: onOpenInPages,
                             onCreate: onCreate,
@@ -356,7 +380,8 @@ struct PagedTranscript: View {
                 state.clearSelection()
                 for step in 0..<12 {
                     alignToTop()
-                    if step >= 2, !messages.contains(where: layout.needsMeasuring) { break }
+                    if step >= 2,
+                       !messages.contains(where: { layout.needsMeasuring($0, thinking: isThinking($0)) }) { break }
                     try? await Task.sleep(nanoseconds: 40_000_000)
                 }
                 settled = true
@@ -438,14 +463,17 @@ struct PagedTranscript: View {
 
     /// Off-screen pass that measures every turn at the sheet's content width.
     /// Backgrounds do not contribute to layout, so this costs nothing visually.
+    /// Rendered with the same fold state the sheets show, so pagination and
+    /// ink map stay true while a thinking fold expands or collapses.
     private var ruler: some View {
         VStack(spacing: 0) {
-            ForEach(messages.filter(layout.needsMeasuring)) { message in
+            ForEach(messages.filter({ layout.needsMeasuring($0, thinking: isThinking($0)) })) { message in
                 MessageBlock(message: message, highlight: "",
-                             baseSize: Paper.bodySize, document: true)
+                             baseSize: Paper.bodySize, document: true,
+                             live: true, liveMessageID: liveMessageID)
                     .frame(width: Paper.contentWidth)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                        layout.record(height, for: message)
+                        layout.record(height, for: message, thinking: isThinking(message))
                     }
             }
         }
@@ -470,6 +498,8 @@ struct PageView: View {
     var scale: CGFloat = 1
     var live = true
     var renderNotes = true
+    /// The assistant turn being generated — nil for exports and static sheets.
+    var liveMessageID: Message.ID?
     var onRegenerate: (Message) -> Void = { _ in }
     var onOpenInPages: (Message) -> Void = { _ in }
     var onCreate: (Annotation) -> Void = { _ in }
@@ -493,6 +523,8 @@ struct PageView: View {
                                  highlight: highlight,
                                  baseSize: Paper.bodySize,
                                  document: true,
+                                 live: live,
+                                 liveMessageID: liveMessageID,
                                  onRegenerate: onRegenerate,
                                  onOpenInPages: onOpenInPages)
                         .frame(width: Paper.contentWidth, alignment: .topLeading)
@@ -542,7 +574,7 @@ struct PageView: View {
     private var textColumns: [TextColumn] {
         guard live, state.tool.isTextMark else { return [] }
         return placements.map { placement in
-            let lines = InkMap.lines(of: placement.message).map { line in
+            let lines = InkMap.lines(of: placement.message, liveMessageID: liveMessageID).map { line in
                 CGRect(x: (Paper.margin + line.minX) / Paper.width,
                        y: (Paper.margin + placement.y + line.minY) / Paper.height,
                        width: line.width / Paper.width,
