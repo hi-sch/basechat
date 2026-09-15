@@ -423,6 +423,7 @@ enum MarkdownParser {
 // MARK: - Rendering
 
 struct MarkdownView: View {
+    @Environment(\.markupOwnsPointer) private var ownsPointer
     let text: String
     var highlight: String = ""
     /// Body type size. Every other size in the renderer is a multiple of it, so
@@ -450,7 +451,10 @@ struct MarkdownView: View {
         .textSelection(.enabled)
         // SwiftUI only swaps in the I-beam directly over glyphs, if at all —
         // message text should feel like text everywhere, code and tables too.
+        // On a sheet the pointer has one owner, which knows about the armed
+        // tool and the marks as well as the type; there, stand down.
         .onHover { inside in
+            guard !ownsPointer else { return }
             if inside { NSCursor.iBeam.set() } else { NSCursor.arrow.set() }
         }
     }

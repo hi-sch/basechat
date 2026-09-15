@@ -48,9 +48,11 @@ final class ModelSettings {
     }
 }
 
-// MARK: - Popover
+// MARK: - The panel
 
-struct ModelSettingsPopover: View {
+/// Hangs under the settings button in the header, wearing the same chrome as
+/// the markup tools' own dropdowns.
+struct ModelSettingsPanel: View {
     @Environment(ModelSettings.self) private var settings
 
     var body: some View {
@@ -88,6 +90,7 @@ struct ModelSettingsPopover: View {
         }
         .padding(16)
         .frame(width: 330)
+        .toolPanel()
     }
 
     private func slider(_ title: String, value: Binding<Double>,

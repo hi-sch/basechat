@@ -3,7 +3,7 @@
 # NOTARY_ISSUER is set (see README).
 set -euo pipefail
 
-VERSION="${VERSION:-0.4.0}"
+VERSION="${VERSION:-0.4.1}"
 APP="dist/BaseChat.app"
 VOL="BaseChat $VERSION"
 DMG="BaseChat-$VERSION.dmg"

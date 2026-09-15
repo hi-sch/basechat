@@ -187,15 +187,24 @@ enum SearchIndex {
     }
 
     /// Paints every occurrence of `term` with the Notes-style yellow wash.
+    ///
+    /// A term spanning several lines is washed a line at a time: the search
+    /// field never asks for one, but the highlight tool does — it measures a
+    /// dragged-over selection by washing it and reading back where the colour
+    /// landed, and a run of text is laid out one line per block.
     static func emphasise(_ source: AttributedString, term: String) -> AttributedString {
         guard !term.isEmpty else { return source }
         var result = source
-        var cursor = result.startIndex
-        while cursor < result.endIndex,
-              let range = result[cursor...].range(of: term, options: .caseInsensitive) {
-            result[range].backgroundColor = Color.yellow.opacity(0.55)
-            result[range].foregroundColor = .black
-            cursor = range.upperBound
+        for line in term.split(whereSeparator: \.isNewline) {
+            let piece = String(line)
+            guard !piece.isEmpty else { continue }
+            var cursor = result.startIndex
+            while cursor < result.endIndex,
+                  let range = result[cursor...].range(of: piece, options: .caseInsensitive) {
+                result[range].backgroundColor = Color.yellow.opacity(0.55)
+                result[range].foregroundColor = .black
+                cursor = range.upperBound
+            }
         }
         return result
     }

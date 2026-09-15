@@ -9,12 +9,48 @@ enum AnnotationTool: Hashable {
     case text
     case shape
 
+    /// Which toolbar button owns a tool. The three text marks share one button
+    /// and one options panel, so they share one family.
+    enum Family: String, Hashable, Identifiable, CaseIterable {
+        case mark, shape, note, sketch
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .mark: return "Highlight"
+            case .shape: return "Shape"
+            case .note: return "Note"
+            case .sketch: return "Draw"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .mark: return "highlighter"
+            case .shape: return "square.on.circle"
+            case .note: return "note.text"
+            case .sketch: return "scribble"
+            }
+        }
+    }
+
     var kind: Annotation.Kind? {
         switch self {
         case .none: return nil
         case .mark(let kind): return kind
         case .sketch: return .sketch
         case .text: return .text
+        case .shape: return .shape
+        }
+    }
+
+    var family: Family? {
+        switch self {
+        case .none: return nil
+        case .mark: return .mark
+        case .sketch: return .sketch
+        case .text: return .note
         case .shape: return .shape
         }
     }
@@ -28,6 +64,18 @@ enum AnnotationTool: Hashable {
         default: return false
         }
     }
+
+    /// The pointer to show while this tool is armed, so the sheet says which
+    /// one is holding it before the first drag. The text marks run along a line
+    /// of type like a selection, so they take the I-beam; everything else is
+    /// drawn at a point, which is what a crosshair is for.
+    @MainActor var cursor: NSCursor? {
+        switch self {
+        case .none: return nil
+        case .mark: return .iBeam
+        case .shape, .text, .sketch: return .crosshair
+        }
+    }
 }
 
 /// Which tool the toolbar has armed, which colour it draws in, and what is selected.
@@ -35,11 +83,54 @@ enum AnnotationTool: Hashable {
 @MainActor
 final class AnnotationState {
     var tool: AnnotationTool = .none
-    var ink: Annotation.Ink = .yellow
     /// Marks are selected several at a time — ⇧-click adds to the set — so a
     /// group of shapes moves and deletes as one.
     var selected: Set<Annotation.ID> = []
     var editing: Annotation.ID?
+
+    // MARK: What each tool draws with
+    //
+    // Kept per tool rather than shared, so reaching for the pen does not
+    // repaint the highlighter, and coming back to a tool finds it as it was
+    // left. A tool's options panel edits exactly these.
+
+    /// Colour of the text marks, and which of the three the pen draws.
+    var ink: Annotation.Ink = .yellow
+    var markKind: Annotation.Kind = .highlight
+
+    var figure: Annotation.Figure = .rectangle
+    var shapeInk: Annotation.Ink = .blue
+    var shapeFilled = false
+    var shapeWidth: Double = 2
+
+    var noteInk: Annotation.Ink = .yellow
+    var noteFontSize: Double = 12
+
+    var sketchInk: Annotation.Ink = .pink
+    var sketchWidth: Double = 2
+
+    /// Which tool's options panel is showing, and where its button sits, so the
+    /// panel can be drawn over the document right under the button that owns it.
+    var options: AnnotationTool.Family?
+    var anchors: [AnnotationTool.Family: CGRect] = [:]
+
+    /// Off, a tool draws one mark and puts itself away; on, it keeps drawing
+    /// until it is put away by hand. Each panel has the switch.
+    var sticky = false
+
+    /// Where the inline inspector is sitting, in page points, so the sheet's
+    /// pointer owner knows that patch is chrome and not paper.
+    var inspectorFrame: CGRect?
+
+    /// Bumped whenever the page asks the header's panels to get out of the way.
+    /// Model settings are not markup, but they hang off the same header and
+    /// close on the same clicks, so they watch this too.
+    private(set) var panelDismissals = 0
+
+    func dismissPanels() {
+        options = nil
+        panelDismissals &+= 1
+    }
 
     /// The lone selected mark, when there is exactly one. Resize handles and
     /// the inline inspector are single-object controls, so they ask for this.
@@ -55,9 +146,60 @@ final class AnnotationState {
         editing = nil
     }
 
-    func arm(_ tool: AnnotationTool) {
-        self.tool = self.tool == tool ? .none : tool
+    /// A click on a toolbar button: take the tool out and open its options. A
+    /// second click on the same button puts both away.
+    func pick(_ tool: AnnotationTool) {
+        if self.tool == tool {
+            self.tool = .none
+            options = nil
+        } else {
+            self.tool = tool
+            options = tool.family
+        }
         clearSelection()
+    }
+
+    /// Switch which mark the pen draws without closing its panel — the three
+    /// text marks are one button.
+    func setMarkKind(_ kind: Annotation.Kind) {
+        markKind = kind
+        tool = .mark(kind)
+    }
+
+    /// Escape, and every click that lands on the paper: give up the panel, then
+    /// the selection, then the tool. One step per press, most local first.
+    func retreat() -> Bool {
+        if editing != nil { editing = nil; return true }
+        if options != nil { options = nil; return true }
+        if !selected.isEmpty { clearSelection(); return true }
+        if tool != .none { tool = .none; return true }
+        return false
+    }
+
+    /// A fresh mark carrying the armed tool's own colour and weight.
+    func draft(kind: Annotation.Kind, page: Int) -> Annotation {
+        var mark = Annotation(kind: kind, page: page, rect: .zero)
+        switch kind {
+        case .highlight, .underline, .strikethrough:
+            mark.ink = ink
+            mark.stroke = ink.shade
+        case .shape:
+            mark.ink = shapeInk
+            mark.stroke = shapeInk.shade
+            mark.fill = shapeFilled ? shapeInk.shade.opacity(0.18) : nil
+            mark.lineWidth = shapeWidth
+            mark.figure = figure
+        case .text:
+            mark.ink = noteInk
+            mark.stroke = noteInk.shade
+            mark.fill = noteInk.shade.opacity(0.16)
+            mark.fontSize = noteFontSize
+        case .sketch:
+            mark.ink = sketchInk
+            mark.stroke = sketchInk.shade
+            mark.lineWidth = sketchWidth
+        }
+        return mark
     }
 }
 
@@ -95,6 +237,29 @@ extension Annotation.Ink {
 }
 
 extension Annotation {
+    /// Moves box, bands and freehand path together — by a delta in page units —
+    /// and keeps the whole mark on the sheet.
+    func moved(dx: CGFloat, dy: CGFloat) -> Annotation {
+        let x = (rect.minX + dx).clamped(upper: 1 - rect.width)
+        let y = (rect.minY + dy).clamped(upper: 1 - rect.height)
+        let stepX = x - rect.minX, stepY = y - rect.minY
+        var next = self
+        next.rect.origin = CGPoint(x: x, y: y)
+        next.bands = bands.map { $0.offsetBy(dx: stepX, dy: stepY) }
+        next.points = points.map { CGPoint(x: $0.x + stepX, y: $0.y + stepY) }
+        return next
+    }
+
+    /// A copy with its own identity, nudged clear of the original so both are
+    /// visible after a duplicate.
+    func duplicated() -> Annotation {
+        var copy = moved(dx: 0.012, dy: 0.012)
+        copy.id = UUID()
+        return copy
+    }
+}
+
+extension Annotation {
     var strokeColor: Color { strokeShade.color }
     var fillColor: Color? { fillShade?.color }
 }
@@ -127,6 +292,9 @@ struct AnnotationLayer: View {
     /// Zoom of the sheet. The inspector divides it out so the bar keeps one
     /// size on screen no matter how far the page is zoomed.
     var scale: CGFloat = 1
+    /// False when the sheet around the layer owns the pointer. Cursors do not
+    /// nest — the last view to set one wins — so only one of the two decides.
+    var managesPointer = true
 
     var onCreate: (Annotation) -> Void = { _ in }
     var onUpdate: (Annotation) -> Void = { _ in }
@@ -169,6 +337,11 @@ struct AnnotationLayer: View {
                 )
                 .contentShape(hitShape(shown))
                 .zIndex(state.isSelected(annotation.id) ? 1 : 0)
+                // Only an idle pointer offers to pick a mark up; while a tool is
+                // armed the plate below owns the cursor.
+                .pointer(managesPointer && self.live && !state.tool.isDrawing
+                         && !annotation.isTextMark ? NSCursor.openHand : nil,
+                         token: state.tool)
                 .onTapGesture(count: 2) {
                     guard self.live, !state.tool.isDrawing else { return }
                     state.selection = annotation.id
@@ -177,6 +350,18 @@ struct AnnotationLayer: View {
                 .gesture(self.live && !state.tool.isDrawing ? grabGesture(annotation) : nil)
                 .contextMenu {
                     if self.live {
+                        Button("Duplicate") {
+                            let copy = annotation.duplicated()
+                            onCreate(copy)
+                            state.selection = copy.id
+                        }
+                        if annotation.kind == .text {
+                            Button("Edit Note") {
+                                state.selection = annotation.id
+                                state.editing = annotation.id
+                            }
+                        }
+                        Divider()
                         Button("Delete", role: .destructive) { onDelete(annotation.id) }
                     }
                 }
@@ -206,6 +391,7 @@ struct AnnotationLayer: View {
             if live, state.tool.isDrawing {
                 Color.white.opacity(0.001)
                     .contentShape(.rect)
+                    .pointer(managesPointer ? state.tool.cursor : nil, token: state.tool)
                     .gesture(createGesture)
             }
         }
@@ -217,10 +403,13 @@ struct AnnotationLayer: View {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 guard let kind = state.tool.kind else { return }
-                if dragOrigin == nil { dragOrigin = value.startLocation }
+                if dragOrigin == nil {
+                    dragOrigin = value.startLocation
+                    // The panel has said its piece; get it off the page.
+                    state.dismissPanels()
+                }
                 let start = dragOrigin ?? value.startLocation
-                var next = draft ?? Annotation(kind: kind, ink: state.ink, page: page, rect: .zero)
-                next.ink = state.ink
+                var next = draft ?? state.draft(kind: kind, page: page)
 
                 switch kind {
                 case .highlight, .underline, .strikethrough:
@@ -229,21 +418,23 @@ struct AnnotationLayer: View {
                 case .sketch:
                     next.points.append(unit(value.location))
                     next.rect = Self.bounds(of: next.points)
+                case .shape where next.figure.isOpen:
+                    next.points = ends(from: start, to: value.location, straighten: Self.shiftHeld)
+                    next.rect = Self.bounds(of: next.points)
                 default:
-                    next.rect = unitRect(from: start, to: value.location)
+                    next.rect = unitRect(from: start, to: value.location, square: Self.shiftHeld)
                 }
                 draft = next
             }
             .onEnded { value in
                 defer { dragOrigin = nil; draft = nil }
                 guard let kind = state.tool.kind else { return }
-                var made = draft ?? Annotation(kind: kind, ink: state.ink, page: page, rect: .zero)
-                made.ink = state.ink
+                var made = draft ?? state.draft(kind: kind, page: page)
+                let point = unit(value.location)
 
                 switch kind {
                 case .text:
                     // A click is enough: drop a note box of a sensible default size.
-                    let point = unit(value.location)
                     made.rect = CGRect(x: min(point.x, 0.62), y: min(point.y, 0.94),
                                        width: 0.3, height: 0.05)
                     made.text = ""
@@ -254,19 +445,48 @@ struct AnnotationLayer: View {
                     made.bands = made.bands.filter { $0.width > 0.004 }
                     guard !made.bands.isEmpty else { return }
                     made.rect = Self.union(made.bands)
+                case .shape where made.figure.isOpen:
+                    // Too short to be a drag: lay a default line down instead of
+                    // dropping the click on the floor.
+                    if made.points.count != 2 || Self.length(made.points) < 0.02 {
+                        made.points = [CGPoint(x: (point.x - 0.09).clamped(), y: point.y),
+                                       CGPoint(x: (point.x + 0.09).clamped(), y: point.y)]
+                    }
+                    made.rect = Self.bounds(of: made.points)
                 default:
-                    guard made.rect.width > 0.004, made.rect.height > 0.004 else { return }
+                    if made.rect.width <= 0.004 || made.rect.height <= 0.004 {
+                        made.rect = CGRect(x: min(point.x, 0.84), y: min(point.y, 0.9),
+                                           width: 0.16, height: 0.1)
+                    }
                 }
 
                 onCreate(made)
                 state.selection = made.id
                 if kind == .text { state.editing = made.id }
-                // One mark per arming. While a tool is armed the whole sheet is
-                // a capture plate, which swallows clicks on the message buttons
-                // and turns a click on a shape into a new shape — so put the
-                // tool away as soon as it has drawn something.
-                state.tool = .none
+                // One mark per arming unless the tool was pinned. While a tool
+                // is armed the whole sheet is a capture plate, which swallows
+                // clicks on the message buttons and turns a click on a shape
+                // into a new shape — so the default is to put it away as soon
+                // as it has drawn something.
+                if !state.sticky { state.tool = .none }
             }
+    }
+
+    /// The two ends of an open figure. ⇧ snaps the line to the nearest 45°.
+    private func ends(from a: CGPoint, to b: CGPoint, straighten: Bool) -> [CGPoint] {
+        let start = unit(a)
+        guard straighten else { return [start, unit(b)] }
+        let dx = b.x - a.x, dy = b.y - a.y
+        let step = CGFloat.pi / 4
+        let angle = (atan2(dy, dx) / step).rounded() * step
+        // How far the drag went along the direction it snapped to.
+        let reach = max(0, dx * cos(angle) + dy * sin(angle))
+        return [start, unit(CGPoint(x: a.x + cos(angle) * reach, y: a.y + sin(angle) * reach))]
+    }
+
+    private static func length(_ points: [CGPoint]) -> CGFloat {
+        guard points.count == 2 else { return 0 }
+        return hypot(points[1].x - points[0].x, points[1].y - points[0].y)
     }
 
     /// Turns a drag into one box per line of text, the way dragging across a
@@ -391,15 +611,7 @@ struct AnnotationLayer: View {
     private static var shiftHeld: Bool { NSEvent.modifierFlags.contains(.shift) }
 
     private func shifted(_ annotation: Annotation, by translation: CGSize) -> Annotation {
-        var moved = annotation
-        let dx = (annotation.rect.minX + translation.width / size.width)
-            .clamped(upper: 1 - annotation.rect.width) - annotation.rect.minX
-        let dy = (annotation.rect.minY + translation.height / size.height)
-            .clamped(upper: 1 - annotation.rect.height) - annotation.rect.minY
-        moved.rect.origin = CGPoint(x: annotation.rect.minX + dx, y: annotation.rect.minY + dy)
-        moved.bands = annotation.bands.map { $0.offsetBy(dx: dx, dy: dy) }
-        moved.points = annotation.points.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }
-        return moved
+        annotation.moved(dx: translation.width / size.width, dy: translation.height / size.height)
     }
 
     private func resized(_ annotation: Annotation, corner: Corner, by translation: CGSize,
@@ -487,9 +699,7 @@ struct AnnotationLayer: View {
                         .frame(width: 8 / scale, height: 8 / scale)
                         .offset(x: corner.point(in: box).x - 4 / scale,
                                 y: corner.point(in: box).y - 4 / scale)
-                        .onHover { inside in
-                            if inside { corner.cursor.push() } else { NSCursor.pop() }
-                        }
+                        .pointer(managesPointer ? corner.cursor : nil, token: state.tool)
                         .gesture(resizeGesture(stored, corner: corner))
                 }
             }
@@ -501,6 +711,11 @@ struct AnnotationLayer: View {
                 .fixedSize()
                 .scaleEffect(1 / scale, anchor: .topLeading)
                 .offset(x: barX, y: barY)
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { measured in
+                    state.inspectorFrame = CGRect(x: barX, y: barY,
+                                                  width: measured.width / scale,
+                                                  height: measured.height / scale)
+                }
         }
         .frame(width: size.width, height: size.height, alignment: .topLeading)
     }
@@ -552,10 +767,18 @@ struct AnnotationLayer: View {
         CGPoint(x: (point.x / size.width).clamped(), y: (point.y / size.height).clamped())
     }
 
-    private func unitRect(from a: CGPoint, to b: CGPoint) -> CGRect {
-        let start = unit(a), end = unit(b)
-        return CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
-                      width: abs(end.x - start.x), height: abs(end.y - start.y))
+    /// The box between two points. ⇧ makes it square on screen, which is not
+    /// square in page units — the sheet is taller than it is wide.
+    private func unitRect(from a: CGPoint, to b: CGPoint, square: Bool = false) -> CGRect {
+        var end = b
+        if square {
+            let side = max(abs(b.x - a.x), abs(b.y - a.y))
+            end = CGPoint(x: a.x + (b.x < a.x ? -side : side),
+                          y: a.y + (b.y < a.y ? -side : side))
+        }
+        let start = unit(a), stop = unit(end)
+        return CGRect(x: min(start.x, stop.x), y: min(start.y, stop.y),
+                      width: abs(stop.x - start.x), height: abs(stop.y - start.y))
     }
 
     private func pixels(_ rect: CGRect) -> CGRect {
@@ -618,7 +841,7 @@ struct AnnotationInspector: View {
 
     static let height: CGFloat = 28
     /// Enough to keep the widest arrangement on the sheet.
-    static let maxWidth: CGFloat = 260
+    static let maxWidth: CGFloat = 300
 
     private var showsStroke: Bool {
         annotation.kind == .shape || annotation.kind == .sketch
@@ -649,7 +872,8 @@ struct AnnotationInspector: View {
                     onUpdate(next)
                 }
 
-                if showsShapeStyle || showsType {
+                // An open figure has no inside to fill.
+                if (showsShapeStyle && !annotation.figure.isOpen) || showsType {
                     well(icon: "NSTouchBarColorPickerFill",
                          fallback: "paintbrush.fill",
                          help: "Fill colour — drop the opacity to zero for no fill",
@@ -663,11 +887,43 @@ struct AnnotationInspector: View {
 
             if showsShapeStyle {
                 PillDivider()
-                stepper(symbol: "rectangle.roundedtop", help: "Corner radius",
-                        values: [0, 2, 4, 8, 14, 22], unit: "pt") { radius in
-                    var next = annotation
-                    next.cornerRadius = radius
-                    onUpdate(next)
+                Menu {
+                    Picker("Shape", selection: Binding(
+                        get: { annotation.figure },
+                        set: { figure in
+                            var next = annotation
+                            next.figure = figure
+                            // A box has no direction to keep; give the open
+                            // figures the diagonal of the box they came from.
+                            if figure.isOpen, next.points.count != 2 {
+                                next.points = [CGPoint(x: next.rect.minX, y: next.rect.minY),
+                                               CGPoint(x: next.rect.maxX, y: next.rect.maxY)]
+                            }
+                            onUpdate(next)
+                        }
+                    )) {
+                        ForEach(Annotation.Figure.allCases) { figure in
+                            Label(figure.label, systemImage: figure.symbol).tag(figure)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    Image(systemName: annotation.figure.symbol)
+                        .font(.system(size: 13, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .frame(width: 26, height: 22)
+                .help("Shape")
+
+                if annotation.figure == .rectangle {
+                    stepper(symbol: "rectangle.roundedtop", help: "Corner radius",
+                            values: [0, 2, 4, 8, 14, 22], unit: "pt") { radius in
+                        var next = annotation
+                        next.cornerRadius = radius
+                        onUpdate(next)
+                    }
                 }
             }
 
@@ -770,6 +1026,141 @@ struct AnnotationInspector: View {
     }
 }
 
+// MARK: - Pointers
+
+/// One owner for the pointer over a sheet.
+///
+/// Cursors do not nest. A view that sets one on hover knows nothing about the
+/// views above and below it, and whichever fires last wins — which is how the
+/// I-beam over message text came to paint over an armed tool's crosshair. So
+/// over a sheet exactly one place decides, on every mouse move, reading the
+/// live state: the armed tool first, then a resize handle, then a mark that can
+/// be picked up, then the type, then the paper.
+struct MarkupPointer: ViewModifier {
+    let state: AnnotationState
+    /// Every mark in the chat; the owner filters to its own sheet.
+    let annotations: [Annotation]
+    let page: Int
+    let size: CGSize
+    /// Sheet zoom. Handles keep one size on screen, so the radius that catches
+    /// one is divided by it, exactly as their drawing is.
+    var scale: CGFloat = 1
+    /// Where this sheet's type sits, in page points.
+    var text: [CGRect] = []
+    var live = true
+
+    func body(content: Content) -> some View {
+        content.onContinuousHover(coordinateSpace: .local) { phase in
+            guard live else { return }
+            switch phase {
+            case .active(let point): cursor(at: point).set()
+            case .ended: NSCursor.arrow.set()
+            }
+        }
+    }
+
+    private var mine: [Annotation] { annotations.filter { $0.page == page } }
+
+    private func cursor(at point: CGPoint) -> NSCursor {
+        if let armed = state.tool.cursor { return armed }
+
+        // A lone selection is the only thing that wears handles and an
+        // inspector, and both belong to the sheet it is on — which is why they
+        // are read here and not from a frame that might be another page's.
+        if let id = state.selection, let mark = mine.first(where: { $0.id == id }) {
+            // The inspector is app chrome floating over the page: it is not
+            // type and not a mark, whatever happens to be behind it.
+            if let bar = state.inspectorFrame, bar.contains(point) { return .arrow }
+
+            if !mark.isTextMark {
+                let box = pixels(mark.rect).insetBy(dx: -3, dy: -3)
+                let catches = 6 / scale
+                for corner in AnnotationLayer.Corner.allCases {
+                    let handle = corner.point(in: box)
+                    if hypot(point.x - handle.x, point.y - handle.y) <= catches {
+                        return corner.cursor
+                    }
+                }
+            }
+        }
+
+        let overMark = mine.contains { mark in
+            !mark.isTextMark && mark.paintedBands.contains {
+                pixels($0).insetBy(dx: -3, dy: -3).contains(point)
+            }
+        }
+        if overMark { return .openHand }
+
+        return text.contains(where: { $0.contains(point) }) ? .iBeam : .arrow
+    }
+
+    private func pixels(_ rect: CGRect) -> CGRect {
+        CGRect(x: rect.minX * size.width, y: rect.minY * size.height,
+               width: rect.width * size.width, height: rect.height * size.height)
+    }
+}
+
+extension View {
+    func markupPointer(state: AnnotationState, annotations: [Annotation], page: Int,
+                       size: CGSize, scale: CGFloat = 1, text: [CGRect] = [],
+                       live: Bool = true) -> some View {
+        modifier(MarkupPointer(state: state, annotations: annotations, page: page,
+                               size: size, scale: scale, text: text, live: live))
+    }
+}
+
+/// Set on the sheets, where `MarkupPointer` decides the cursor, so the views
+/// inside them stop setting their own.
+struct MarkupOwnsPointerKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var markupOwnsPointer: Bool {
+        get { self[MarkupOwnsPointerKey.self] }
+        set { self[MarkupOwnsPointerKey.self] = newValue }
+    }
+}
+
+/// Pushes a cursor while the pointer is inside, and — the part `onHover` alone
+/// gets wrong — pops it again when the cursor itself changes under a pointer
+/// that never left, which is what happens when a tool is swapped mid-hover.
+private struct Pointer<Token: Equatable>: ViewModifier {
+    let cursor: NSCursor?
+    let token: Token
+
+    @State private var inside = false
+    @State private var pushed = false
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { inside = $0; settle() }
+            .onChange(of: token) { _, _ in
+                // Pop first: the stack is a stack, and the old cursor is on it.
+                if pushed { NSCursor.pop(); pushed = false }
+                settle()
+            }
+            .onDisappear {
+                if pushed { NSCursor.pop(); pushed = false }
+            }
+    }
+
+    private func settle() {
+        let want = inside && cursor != nil
+        guard want != pushed else { return }
+        if want { cursor?.push() } else { NSCursor.pop() }
+        pushed = want
+    }
+}
+
+extension View {
+    /// `token` is whatever makes `cursor` change — the modifier watches it so a
+    /// swap is not missed while the pointer sits still.
+    func pointer<Token: Equatable>(_ cursor: NSCursor?, token: Token) -> some View {
+        modifier(Pointer(cursor: cursor, token: token))
+    }
+}
+
 /// An AppKit template image when there is one, an SF Symbol when there is not.
 struct SystemGlyph: View {
     let name: String
@@ -848,14 +1239,22 @@ struct AnnotationShape: View {
                             style: .init(lineWidth: annotation.lineWidth,
                                          lineCap: .round, lineJoin: .round))
 
+            case .shape where annotation.figure.isOpen:
+                OpenFigure(points: annotation.points,
+                           head: annotation.figure == .arrow,
+                           size: size,
+                           lineWidth: annotation.lineWidth)
+                    .stroke(annotation.strokeColor,
+                            style: .init(lineWidth: annotation.lineWidth,
+                                         lineCap: .round, lineJoin: .round))
+
             case .shape:
                 let frame = box(annotation.rect)
-                RoundedRectangle(cornerRadius: annotation.cornerRadius)
+                let outline = FigureShape(figure: annotation.figure,
+                                          cornerRadius: annotation.cornerRadius)
+                outline
                     .fill(annotation.fillColor ?? Color.clear)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: annotation.cornerRadius)
-                            .stroke(annotation.strokeColor, lineWidth: annotation.lineWidth)
-                    }
+                    .overlay { outline.stroke(annotation.strokeColor, lineWidth: annotation.lineWidth) }
                     .frame(width: frame.width, height: frame.height)
                     .offset(x: frame.minX, y: frame.minY)
 
@@ -867,6 +1266,79 @@ struct AnnotationShape: View {
             }
         }
         .frame(width: size.width, height: size.height, alignment: .topLeading)
+    }
+}
+
+/// The outline of a closed figure, drawn to fill its box.
+struct FigureShape: Shape {
+    let figure: Annotation.Figure
+    var cornerRadius: CGFloat = 0
+
+    func path(in rect: CGRect) -> Path {
+        switch figure {
+        case .rectangle:
+            let radius = min(cornerRadius, min(rect.width, rect.height) / 2)
+            return Path(roundedRect: rect, cornerRadius: max(0, radius))
+        case .ellipse:
+            return Path(ellipseIn: rect)
+        case .triangle:
+            return polygon([CGPoint(x: 0.5, y: 0), CGPoint(x: 1, y: 1), CGPoint(x: 0, y: 1)], in: rect)
+        case .diamond:
+            return polygon([CGPoint(x: 0.5, y: 0), CGPoint(x: 1, y: 0.5),
+                            CGPoint(x: 0.5, y: 1), CGPoint(x: 0, y: 0.5)], in: rect)
+        case .star:
+            return polygon(Self.star, in: rect)
+        case .line, .arrow:
+            return Path()
+        }
+    }
+
+    private func polygon(_ points: [CGPoint], in rect: CGRect) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        func place(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: rect.minX + point.x * rect.width, y: rect.minY + point.y * rect.height)
+        }
+        path.move(to: place(first))
+        for point in points.dropFirst() { path.addLine(to: place(point)) }
+        path.closeSubpath()
+        return path
+    }
+
+    /// Ten alternating points on two circles, starting at the top.
+    private static let star: [CGPoint] = (0..<10).map { step in
+        let radius: CGFloat = step.isMultiple(of: 2) ? 0.5 : 0.21
+        let angle = -CGFloat.pi / 2 + CGFloat(step) * .pi / 5
+        return CGPoint(x: 0.5 + cos(angle) * radius, y: 0.5 + sin(angle) * radius)
+    }
+}
+
+/// A line between two ends, with an arrow head when it is an arrow. Ends are
+/// normalized to the page, so the figure keeps the diagonal it was drawn on.
+private struct OpenFigure: Shape {
+    let points: [CGPoint]
+    let head: Bool
+    let size: CGSize
+    let lineWidth: CGFloat
+
+    func path(in _: CGRect) -> Path {
+        var path = Path()
+        guard points.count >= 2 else { return path }
+        let from = CGPoint(x: points[0].x * size.width, y: points[0].y * size.height)
+        let to = CGPoint(x: points[1].x * size.width, y: points[1].y * size.height)
+        path.move(to: from)
+        path.addLine(to: to)
+
+        guard head else { return path }
+        let angle = atan2(to.y - from.y, to.x - from.x)
+        let reach = max(7, lineWidth * 3.5)
+        let spread = CGFloat.pi * 0.82
+        for side in [spread, -spread] {
+            path.move(to: to)
+            path.addLine(to: CGPoint(x: to.x + cos(angle + side) * reach,
+                                     y: to.y + sin(angle + side) * reach))
+        }
+        return path
     }
 }
 
@@ -924,18 +1396,22 @@ private struct NoteBox: View {
     }
 }
 
-// MARK: - ⌫ over the document
+// MARK: - Keys over the document
 
-/// Deletes whatever marks are selected when ⌫ or ⌦ is pressed.
+/// The keyboard half of editing marks: ⌫ deletes the selection, the arrows
+/// nudge it, ⌘D duplicates it.
 ///
-/// A menu item carrying a `⌫` key equivalent looks like the tidy way to do
-/// this, but a `Commands` body is not a view: it does not re-read the
-/// observable selection, so the item stayed disabled and the key never reached
-/// it. A local monitor sees the key before the menu does and decides on live
-/// state — and gets out of the way whenever a caret is in a field.
-struct DeleteMarkupKey: ViewModifier {
+/// Menu items carrying those key equivalents look like the tidy way to do this,
+/// but a `Commands` body is not a view: it does not re-read the observable
+/// selection, so the items stayed disabled and the keys never reached them. A
+/// local monitor sees them before the menu does and decides on live state — and
+/// gets out of the way whenever a caret is in a field.
+struct MarkupKeys: ViewModifier {
     let state: AnnotationState
-    let perform: () -> Void
+    let delete: () -> Void
+    /// Distance in points on the page, already scaled by whether ⇧ was held.
+    let nudge: (CGSize) -> Void
+    let duplicate: () -> Void
 
     @State private var monitor: Any?
 
@@ -944,11 +1420,25 @@ struct DeleteMarkupKey: ViewModifier {
             .onAppear {
                 guard monitor == nil else { return }
                 monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    guard Self.isDelete(event), state.editing == nil,
-                          !state.selected.isEmpty, !Self.isTyping
+                    guard state.editing == nil, !state.selected.isEmpty, !Self.isTyping
                     else { return event }
-                    perform()
-                    return nil
+
+                    if Self.isDelete(event) {
+                        delete()
+                        return nil
+                    }
+                    if event.charactersIgnoringModifiers == "d",
+                       event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
+                        duplicate()
+                        return nil
+                    }
+                    if let step = Self.arrow(event) {
+                        // ⇧ takes the big step, the way it does in every canvas.
+                        let far: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
+                        nudge(CGSize(width: step.width * far, height: step.height * far))
+                        return nil
+                    }
+                    return event
                 }
             }
             .onDisappear {
@@ -964,8 +1454,19 @@ struct DeleteMarkupKey: ViewModifier {
             && !event.modifierFlags.contains(.command)
     }
 
+    private static func arrow(_ event: NSEvent) -> CGSize? {
+        guard !event.modifierFlags.contains(.command) else { return nil }
+        switch event.keyCode {
+        case 123: return CGSize(width: -1, height: 0)
+        case 124: return CGSize(width: 1, height: 0)
+        case 125: return CGSize(width: 0, height: 1)
+        case 126: return CGSize(width: 0, height: -1)
+        default: return nil
+        }
+    }
+
     /// True while the caret is in a field or a note: the composer, the search
-    /// field and an open note all keep their own delete key.
+    /// field and an open note all keep their own keys.
     private static var isTyping: Bool {
         let responder = NSApp.keyWindow?.firstResponder
         if let text = responder as? NSTextView { return text.isEditable }
@@ -974,7 +1475,10 @@ struct DeleteMarkupKey: ViewModifier {
 }
 
 extension View {
-    func deleteMarkupKey(_ state: AnnotationState, perform: @escaping () -> Void) -> some View {
-        modifier(DeleteMarkupKey(state: state, perform: perform))
+    func markupKeys(_ state: AnnotationState,
+                    delete: @escaping () -> Void,
+                    nudge: @escaping (CGSize) -> Void,
+                    duplicate: @escaping () -> Void) -> some View {
+        modifier(MarkupKeys(state: state, delete: delete, nudge: nudge, duplicate: duplicate))
     }
 }

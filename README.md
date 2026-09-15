@@ -25,10 +25,24 @@ downloaded on first use, with progress shown above the composer.
 **Markup, the way Preview does it.** Highlight, underline and strike-through behave as text
 selections: a drag produces one band per line, snapped to the measured ink of the glyphs, so a
 band covers the letters and nothing else — no colour past the last word or above the tallest
-letter. They can be recoloured and deleted, not dragged. Shapes, notes and freehand sketches are
-objects: select, move, resize from any corner (hold ⇧ to keep proportions), and restyle from an
-inline inspector — any border and fill colour, opacity included, through the system colour panel.
+letter. They can be recoloured and deleted, not dragged. Shapes — rectangle, ellipse, triangle,
+diamond, star, line and arrow — notes and freehand sketches are objects: select, move, resize from
+any corner (hold ⇧ to keep proportions), nudge with the arrow keys, duplicate with ⌘D, and restyle
+from an inline inspector — any border and fill colour, opacity included, through the system colour
+panel. Dragging across bare paper rubber-bands everything it touches into one selection.
 Markup is available in both the paginated document and the continuous transcript.
+
+**One button per tool, options underneath.** The tool buttons sit in one pill. Each arms its tool
+and drops its own panel under itself: the three text marks and their colour, the shape
+list, note colour and type size, pen colour and weight, and whether the tool stays out after it
+has drawn — and the model settings hang off the header as one of the same panels. Each tool
+remembers what it draws with, so reaching for the pen does not repaint the highlighter. One place
+owns the pointer over a sheet and decides it on every move — the armed tool, the resize cursor on a
+selection handle, an open hand over a mark, the I-beam over type — because cursors do not nest and
+the last view to set one wins. Select text first and the highlighter marks it on the spot, without being armed at
+all — it finds the words by laying the turn out again with them washed and reading back where the
+colour landed, so the bands hug the glyphs exactly. Ambiguous selections — the same words twice in
+one turn — arm the tool instead of guessing.
 
 **PDF export.** Each sheet is drawn into a `CGPDFContext`, so the output is vector with selectable
 text. Notes become real PDF text annotations, so they open as notes rather than as a picture of
@@ -69,7 +83,7 @@ budget, older turns are dropped and the reply says so.
 until the engine is ready. Hub downloads have a Cancel button.
 
 **Chats.** Double-click a sidebar title (or Rename in the context menu) to name a chat. Delete
-chat and delete markup both undo with ⌘Z. A failed write of `chats.json` shows an error above the
+chat and every markup edit — added, deleted, moved, resized, restyled — undo with ⌘Z. A failed write of `chats.json` shows an error above the
 composer instead of failing silently.
 
 
@@ -88,7 +102,7 @@ composer instead of failing silently.
 ## Run
 
 A built app is in `dist/BaseChat.app` — double-click it, or drag it to `/Applications`.
-`BaseChat-0.4.0.dmg` is the distributable: a 640×400 install window with the app, an Applications
+`BaseChat-0.4.1.dmg` is the distributable: a 640×400 install window with the app, an Applications
 alias, and an arrow between them.
 
 ## Packaging
@@ -154,12 +168,16 @@ codesign --force --deep --sign - dist/BaseChat.app
 | ⌘N | New chat |
 | ⌘↩ | Send |
 | ⌘F | Search |
-| ⎋ | Close search, or put the armed markup tool away |
+| ⎋ | Close search, then the open tool panel, the selection, and the armed tool — one step per press |
+| ⌥⌘1 … ⌥⌘4 | Highlighter, shape, note, pen |
 | ⌘B | Bold |
 | ⌘I | Italic |
 | ⇧ while resizing | Keep a shape's proportions |
+| ⇧ while drawing | Square off a shape, or hold a line to 45° |
+| ⌘Z | Undo a deleted chat, and any markup added, deleted, moved or restyled |
+| ↑ ↓ ← → | Nudge the selected marks (⇧ for ten points) |
+| ⌘D | Duplicate the selected marks |
 | ↩ (in the search field) | Jump to the next match, wrapping at the end |
-| ⌘Z | Undo delete chat or delete markup |
 | ⌫ | Delete the selected marks, or the selected chats |
 | ⇧/⌘-click | Select several chats |
 | ⇧-click on a mark | Add it to the selection, or take it back out |
@@ -170,7 +188,9 @@ codesign --force --deep --sign - dist/BaseChat.app
 | File | What lives there |
 | --- | --- |
 | `Pages.swift` | Sheet metrics, pagination, the document view, and the ink scan the highlighter snaps to |
-| `Annotations.swift` | Markup state, the layer drawn over each sheet, and the inline inspector |
+| `Annotations.swift` | Markup state, the layer drawn over each sheet, the figures, and the inline inspector |
+| `MarkupToolbar.swift` | The tool buttons and the options panel each one opens |
+| `TextSelectionMarkup.swift` | Turning an existing text selection into highlight bands |
 | `Dictation.swift` | Microphone capture through `SpeechAnalyzer` |
 | `PDFExport.swift` | Sheets to vector PDF, notes to PDF annotations |
 | `PagesHandoff.swift` | Markdown to styled RTF for Apple Pages |

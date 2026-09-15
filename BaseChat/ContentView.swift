@@ -125,9 +125,13 @@ struct ChatView: View {
     @State private var errorText: String?
     @State private var copiedConversation = false
     @State private var showSettings = false
+    /// Where the settings button sits, so its panel can hang under it like the
+    /// markup tools' do.
+    @State private var settingsAnchor: CGRect = .zero
 
     var body: some View {
         transcript
+            .overlay(alignment: .topLeading) { markupOptions }
             .safeAreaInset(edge: .bottom) { composerBar }
             .overlay { statusOverlay }
             .navigationTitle(store.current?.title ?? "BaseChat")
@@ -138,11 +142,28 @@ struct ChatView: View {
             // never the one to show — ask for the background outright.
             .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
             .onDeleteCommand(perform: deleteSelectedAnnotation)
-            .deleteMarkupKey(annotations, perform: deleteSelectedAnnotation)
+            .markupKeys(annotations,
+                        delete: deleteSelectedAnnotation,
+                        nudge: nudgeSelectedAnnotations,
+                        duplicate: duplicateSelectedAnnotations)
             .onExitCommand {
                 // An open-but-empty field still counts: Escape closes the field
-                // exactly like its own x button.
-                if search.visible { search.exit() } else { annotations.arm(.none) }
+                // exactly like its own x button. After that Escape belongs to
+                // the panels and the markup, which give themselves up a layer
+                // at a time.
+                if search.visible {
+                    search.exit()
+                } else if showSettings {
+                    showSettings = false
+                } else {
+                    _ = annotations.retreat()
+                }
+            }
+            // A click on the page puts every header panel away, and opening a
+            // tool's options closes the settings beside it.
+            .onChange(of: annotations.panelDismissals) { _, _ in showSettings = false }
+            .onChange(of: annotations.options) { _, open in
+                if open != nil { showSettings = false }
             }
             // Every hit in the open chat, so ↩ can walk them and the document
             // can bring each one into view.
@@ -189,7 +210,7 @@ struct ChatView: View {
                 },
                 onUpdate: { annotation in
                     guard let id = store.currentID else { return }
-                    store.update(annotation, in: id)
+                    store.update(annotation, in: id, undoManager: undoManager)
                 },
                 onDelete: { annotationID in
                     guard let id = store.currentID else { return }
@@ -212,7 +233,7 @@ struct ChatView: View {
                 },
                 onUpdate: { annotation in
                     guard let id = store.currentID else { return }
-                    store.update(annotation, in: id)
+                    store.update(annotation, in: id, undoManager: undoManager)
                 },
                 onDelete: { annotationID in
                     guard let id = store.currentID else { return }
@@ -222,6 +243,30 @@ struct ChatView: View {
                 focusToken: search.jump
             )
         }
+    }
+
+    /// The open tool's options, floating under the button that opened them.
+    /// They live over the document rather than in a popover so the next click
+    /// is a stroke on the page and not a dismissal.
+    @ViewBuilder
+    private var markupOptions: some View {
+        GeometryReader { geometry in
+            let here = geometry.frame(in: .global)
+            if let family = annotations.options, let anchor = annotations.anchors[family] {
+                UnderAnchor(anchor: anchor, container: here) {
+                    ToolOptions(state: annotations, family: family)
+                }
+                .transition(.opacity)
+            }
+            if showSettings, settingsAnchor != .zero {
+                UnderAnchor(anchor: settingsAnchor, container: here) {
+                    ModelSettingsPanel()
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: annotations.options)
+        .animation(.easeOut(duration: 0.12), value: showSettings)
     }
 
     // MARK: Composer
@@ -432,18 +477,20 @@ struct ChatView: View {
                 .padding(.horizontal, 4)
                 .help("Model")
 
-                ToolButton(symbol: "slider.horizontal.3", help: "Model settings") {
+                ToolButton(symbol: "slider.horizontal.3",
+                           help: "Model settings",
+                           active: showSettings) {
                     showSettings.toggle()
+                    annotations.options = nil
                 }
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    ModelSettingsPopover()
-                        .environment(settings)
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+                    settingsAnchor = frame
                 }
             }
         }
 
         ToolbarItem(placement: .principal) {
-            MarkupTools(state: annotations)
+            MarkupTools(state: annotations, highlightSelection: highlightTextSelection)
                 .padding(.trailing, 10)
         }
 
@@ -532,6 +579,46 @@ struct ChatView: View {
             store.removeAnnotation(mark, in: id, undoManager: undoManager)
         }
         annotations.clearSelection()
+    }
+
+    /// Arrow keys. The step arrives in points on the sheet; the marks are
+    /// stored in page units, so it is divided down here.
+    private func nudgeSelectedAnnotations(by step: CGSize) {
+        guard let id = store.currentID else { return }
+        let moving = store.annotations(in: id).filter {
+            annotations.isSelected($0.id) && !$0.isTextMark
+        }
+        guard !moving.isEmpty else { return }
+        for mark in moving {
+            store.update(mark.moved(dx: step.width / Paper.width, dy: step.height / Paper.height),
+                         in: id, undoManager: undoManager)
+        }
+    }
+
+    private func duplicateSelectedAnnotations() {
+        guard let id = store.currentID else { return }
+        let copies = store.annotations(in: id)
+            .filter { annotations.isSelected($0.id) }
+            .map { $0.duplicated() }
+        guard !copies.isEmpty else { return }
+        for copy in copies { store.add(copy, to: id, undoManager: undoManager) }
+        annotations.selected = Set(copies.map(\.id))
+    }
+
+    /// The highlighter's other way in: mark the text the reader already
+    /// selected, and say whether there was any.
+    private func highlightTextSelection() -> Bool {
+        guard let chat = store.current, let id = store.currentID, paged,
+              let selection = TextSelectionMarkup.selectedText()
+        else { return false }
+        let made = TextSelectionMarkup.marks(for: selection, in: chat,
+                                             layout: layout, state: annotations)
+        guard !made.isEmpty else { return false }
+        for mark in made { store.add(mark, to: id, undoManager: undoManager) }
+        annotations.tool = .none
+        annotations.options = nil
+        annotations.selected = Set(made.map(\.id))
+        return true
     }
 
     private var modelLabel: String {
@@ -1106,68 +1193,6 @@ struct ToolButton: View {
         .disabled(disabled)
         .opacity(disabled ? 0.4 : 1)
         .help(help)
-    }
-}
-
-/// Highlight pen with its colour menu, plus shape / note / sketch — `design_insp_4`.
-struct MarkupTools: View {
-    @Bindable var state: AnnotationState
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Pill {
-                ToolButton(symbol: "highlighter",
-                           help: "Highlight",
-                           active: state.tool == .mark(.highlight)) {
-                    state.arm(.mark(.highlight))
-                }
-                Menu {
-                    Picker("Colour", selection: $state.ink) {
-                        ForEach(Annotation.Ink.allCases) { ink in
-                            Label {
-                                Text(ink.label)
-                            } icon: {
-                                Image(systemName: "circle.fill").foregroundStyle(ink.color)
-                            }
-                            .tag(ink)
-                        }
-                    }
-                    .pickerStyle(.inline)
-
-                    Divider()
-                    Button {
-                        state.arm(.mark(.underline))
-                    } label: {
-                        Label("Underline", systemImage: "underline")
-                    }
-                    Button {
-                        state.arm(.mark(.strikethrough))
-                    } label: {
-                        Label("Strike-through", systemImage: "strikethrough")
-                    }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .frame(width: 20, height: 22)
-                .help("Highlight colour and style")
-            }
-
-            Pill {
-                ToolButton(symbol: "square.on.circle", help: "Shape", active: state.tool == .shape) {
-                    state.arm(.shape)
-                }
-                ToolButton(symbol: "note.text", help: "Note", active: state.tool == .text) {
-                    state.arm(.text)
-                }
-                ToolButton(symbol: "scribble", help: "Sketch", active: state.tool == .sketch) {
-                    state.arm(.sketch)
-                }
-            }
-        }
     }
 }
 

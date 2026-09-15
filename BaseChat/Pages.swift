@@ -153,6 +153,102 @@ enum InkMap {
         }
         return lines
     }
+
+    // MARK: Finding a run of text
+
+    private struct RunKey: Hashable {
+        let text: String
+        let selection: String
+        let width: CGFloat
+    }
+
+    private static var runCache: [RunKey: [CGRect]] = [:]
+    private static var runOrder: [RunKey] = []
+
+    /// Where a run of text sits inside a turn — one box per line it covers, in
+    /// points from the turn's top-left.
+    ///
+    /// There is no public way to ask SwiftUI where a piece of its text ended
+    /// up, so the turn is rendered once with that run washed in the search
+    /// colour and the wash is read back off the bitmap. It is the same layout
+    /// the sheet draws, so the boxes land on the glyphs exactly, and the
+    /// answer is cached — one render per selection, not per frame.
+    static func runs(of message: Message, matching selection: String,
+                     width: CGFloat = Paper.contentWidth) -> [CGRect] {
+        let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let key = RunKey(text: message.text, selection: trimmed, width: width)
+        if let known = runCache[key] { return known }
+
+        let found = scanRuns(message, selection: trimmed, width: width)
+        runCache[key] = found
+        runOrder.append(key)
+        if runOrder.count > 24 { runCache.removeValue(forKey: runOrder.removeFirst()) }
+        return found
+    }
+
+    private static func scanRuns(_ message: Message, selection: String, width: CGFloat) -> [CGRect] {
+        let lines = self.lines(of: message, width: width)
+        guard !lines.isEmpty else { return [] }
+
+        let block = ZStack(alignment: .topLeading) {
+            Color.white
+            MessageBlock(message: message, highlight: selection,
+                         baseSize: Paper.bodySize, document: true, live: true)
+        }
+        .frame(width: width, alignment: .topLeading)
+        .environment(\.colorScheme, .light)
+
+        let renderer = ImageRenderer(content: block)
+        let sample: CGFloat = 2
+        renderer.scale = sample
+        guard let image = renderer.cgImage, image.width > 0, image.height > 0 else { return [] }
+
+        let pixelWidth = image.width
+        let pixelHeight = image.height
+        let stride = pixelWidth * 4
+        let raw = UnsafeMutablePointer<UInt8>.allocate(capacity: stride * pixelHeight)
+        raw.initialize(repeating: 0, count: stride * pixelHeight)
+        defer { raw.deallocate() }
+
+        guard let context = CGContext(
+            data: raw, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: stride,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return [] }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+
+        // The wash is `Color.yellow.opacity(0.55)` over paper: red and green
+        // stay near white while blue drops by half. Nothing else on a sheet is
+        // that colour — the type is black, the bubbles and code plates grey.
+        func washed(_ x: Int, _ y: Int) -> Bool {
+            let at = y * stride + x * 4
+            let red = Int(raw[at]), green = Int(raw[at + 1]), blue = Int(raw[at + 2])
+            return red >= 205 && green >= 185 && blue <= 190
+                && red - blue >= 45 && green - blue >= 35
+        }
+
+        // Slice the wash by the turn's own lines rather than by blank rows:
+        // two washed lines of one selection can meet with no gap between them.
+        var boxes: [CGRect] = []
+        for line in lines {
+            let top = max(0, Int(line.minY * sample))
+            let bottom = min(pixelHeight - 1, Int(line.maxY * sample))
+            guard top <= bottom else { continue }
+            var first = Int.max, last = -1
+            for y in top...bottom {
+                for x in 0..<pixelWidth where washed(x, y) {
+                    if x < first { first = x }
+                    if x > last { last = x }
+                }
+            }
+            guard last >= first else { continue }
+            boxes.append(CGRect(x: CGFloat(first) / sample, y: line.minY,
+                                width: CGFloat(last - first + 1) / sample, height: line.height))
+        }
+        return boxes
+    }
 }
 
 /// One turn placed on one sheet. `y` is measured from the top of that sheet's
@@ -506,16 +602,16 @@ struct PageView: View {
     var onUpdate: (Annotation) -> Void = { _ in }
     var onDelete: (Annotation.ID) -> Void = { _ in }
 
+    /// The rubber band being dragged over bare paper, in page points.
+    @State private var marquee: CGRect?
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             // Bottom of the stack, so a click only reaches the paper when it
             // missed every mark and every button above it — which is exactly
             // when the selection should be dropped.
             Color.white
-                .onTapGesture {
-                    guard live, !state.tool.isDrawing else { return }
-                    state.clearSelection()
-                }
+                .gesture(live && !state.tool.isDrawing ? marqueeGesture : nil)
 
             ZStack(alignment: .topLeading) {
                 ForEach(placements) { placement in
@@ -540,6 +636,15 @@ struct PageView: View {
             }
             .frame(width: Paper.contentWidth, height: Paper.contentHeight, alignment: .topLeading)
             .clipped()
+            // Clicking the text is "clicking anything else" as far as a
+            // selected mark is concerned. Simultaneous, so selecting and
+            // copying the text itself still works exactly as before.
+            .simultaneousGesture(live && !state.tool.isDrawing
+                                 ? TapGesture().onEnded {
+                                     state.dismissPanels()
+                                     state.clearSelection()
+                                 }
+                                 : nil)
             .padding(.horizontal, Paper.margin)
             .padding(.top, Paper.margin)
 
@@ -555,16 +660,91 @@ struct PageView: View {
                 renderNotes: renderNotes,
                 appearance: appearance,
                 scale: scale,
+                managesPointer: false,
                 onCreate: onCreate,
                 onUpdate: onUpdate,
                 onDelete: onDelete
             )
+
+            if let marquee {
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.10))
+                    .overlay {
+                        Rectangle().stroke(Color.accentColor.opacity(0.7),
+                                           style: .init(lineWidth: 1, dash: [3, 2]))
+                    }
+                    .frame(width: marquee.width, height: marquee.height)
+                    .offset(x: marquee.minX, y: marquee.minY)
+                    .allowsHitTesting(false)
+            }
         }
         .frame(width: Paper.width, height: Paper.height, alignment: .topLeading)
         .clipped()
+        // The sheet owns the pointer for everything on it — tool, handles,
+        // marks and type — so nothing inside has to guess what is above it.
+        .markupPointer(state: state, annotations: annotations, page: index,
+                       size: CGSize(width: Paper.width, height: Paper.height),
+                       scale: scale, text: textRegions, live: live)
+        .environment(\.markupOwnsPointer, true)
         // Pages are paper: they stay white whatever the app appearance is.
         .environment(\.colorScheme, .light)
         .shadow(color: .black.opacity(live ? 0.35 : 0), radius: live ? 5 : 0, y: live ? 2 : 0)
+    }
+
+    // MARK: Rubber-band selection
+
+    /// Dragging across bare paper sweeps up every mark the band touches; a plain
+    /// click on it is how a selection — and an open options panel — is dropped.
+    private var marqueeGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                let box = Self.box(from: value.startLocation, to: value.location)
+                marquee = box
+                guard Self.isDrag(box) else { return }
+                state.selected = swept(by: box)
+            }
+            .onEnded { value in
+                let box = Self.box(from: value.startLocation, to: value.location)
+                marquee = nil
+                if Self.isDrag(box) {
+                    state.selected = swept(by: box)
+                } else {
+                    state.dismissPanels()
+                    state.clearSelection()
+                }
+            }
+    }
+
+    private static func box(from a: CGPoint, to b: CGPoint) -> CGRect {
+        CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+               width: abs(b.x - a.x), height: abs(b.y - a.y))
+    }
+
+    private static func isDrag(_ box: CGRect) -> Bool { box.width > 3 || box.height > 3 }
+
+    /// The marks this sheet holds that the band touches. ⇧ adds to whatever was
+    /// already selected instead of starting over.
+    private func swept(by box: CGRect) -> Set<Annotation.ID> {
+        let band = CGRect(x: box.minX / Paper.width, y: box.minY / Paper.height,
+                          width: box.width / Paper.width, height: box.height / Paper.height)
+        var caught = NSEvent.modifierFlags.contains(.shift) ? state.selected : []
+        for mark in annotations where mark.page == index {
+            if mark.paintedBands.contains(where: { $0.intersects(band) }) {
+                caught.insert(mark.id)
+            }
+        }
+        return caught
+    }
+
+    /// The block each turn occupies on this sheet, in page points — near enough
+    /// for the pointer to know it is over type rather than paper.
+    private var textRegions: [CGRect] {
+        placements.map { placement in
+            let top = max(0, placement.y)
+            return CGRect(x: Paper.margin, y: Paper.margin + top,
+                          width: Paper.contentWidth,
+                          height: min(placement.height, Paper.contentHeight - top))
+        }
     }
 
     /// Where every line of text on this sheet actually is, normalized to the

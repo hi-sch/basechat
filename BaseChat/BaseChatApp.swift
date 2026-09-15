@@ -43,7 +43,20 @@ struct BaseChatApp: App {
                 // ⌫ for the selected markup used to live here as a menu item.
                 // A `Commands` body is not a view, so it never re-read the
                 // selection and the item stayed disabled — the transcript owns
-                // that key now, through `deleteMarkupKey`.
+                // that key now, through `markupKeys`.
+            }
+
+            // Arming a tool needs no live state, so these are safe as menu
+            // items. The digits keep clear of ⌥⌘H, which belongs to Hide Others.
+            CommandMenu("Markup") {
+                Button("Highlight") { markup.pick(.mark(markup.markKind)) }
+                    .keyboardShortcut("1", modifiers: [.command, .option])
+                Button("Shape") { markup.pick(.shape) }
+                    .keyboardShortcut("2", modifiers: [.command, .option])
+                Button("Note") { markup.pick(.text) }
+                    .keyboardShortcut("3", modifiers: [.command, .option])
+                Button("Draw") { markup.pick(.sketch) }
+                    .keyboardShortcut("4", modifiers: [.command, .option])
             }
         }
     }

@@ -143,12 +143,49 @@ final class ChatStore {
         undoManager?.setActionName("Add Markup")
     }
 
-    func update(_ annotation: Annotation, in id: Chat.ID) {
+    func update(_ annotation: Annotation, in id: Chat.ID, undoManager: UndoManager? = nil) {
         guard let i = chats.firstIndex(where: { $0.id == id }),
               let j = chats[i].annotations.firstIndex(where: { $0.id == annotation.id })
         else { return }
+        let before = chats[i].annotations[j]
         chats[i].annotations[j] = annotation
         save()
+        // A note being typed updates on every keystroke; that belongs to the
+        // field's own undo, not the document's.
+        guard let undoManager, before.text == annotation.text, before != annotation else { return }
+        undoManager.registerUndo(withTarget: self) { store in
+            store.update(before, in: id, undoManager: undoManager)
+        }
+        undoManager.setActionName("Change Markup")
+    }
+
+    /// Moves a mark to the front or the back of the stack it is drawn in.
+    func reorder(_ annotationID: Annotation.ID, toFront: Bool, in id: Chat.ID,
+                 undoManager: UndoManager? = nil) {
+        guard let i = chats.firstIndex(where: { $0.id == id }),
+              let j = chats[i].annotations.firstIndex(where: { $0.id == annotationID }),
+              chats[i].annotations.count > 1
+        else { return }
+        let mark = chats[i].annotations.remove(at: j)
+        chats[i].annotations.insert(mark, at: toFront ? chats[i].annotations.endIndex : 0)
+        save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.restore(mark, at: j, in: id, undoManager: undoManager)
+        }
+        undoManager?.setActionName(toFront ? "Bring Markup to Front" : "Send Markup to Back")
+    }
+
+    private func restore(_ annotation: Annotation, at index: Int, in id: Chat.ID,
+                         undoManager: UndoManager? = nil) {
+        guard let i = chats.firstIndex(where: { $0.id == id }),
+              let j = chats[i].annotations.firstIndex(where: { $0.id == annotation.id })
+        else { return }
+        let mark = chats[i].annotations.remove(at: j)
+        chats[i].annotations.insert(mark, at: min(index, chats[i].annotations.endIndex))
+        save()
+        undoManager?.registerUndo(withTarget: self) { store in
+            store.restore(mark, at: j, in: id, undoManager: undoManager)
+        }
     }
 
     func removeAnnotation(_ annotationID: Annotation.ID, in id: Chat.ID, undoManager: UndoManager? = nil) {

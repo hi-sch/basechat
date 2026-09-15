@@ -117,6 +117,46 @@ struct Annotation: Identifiable, Codable, Hashable {
 
         static let clear = Shade(red: 0, green: 0, blue: 0, alpha: 0)
         var isClear: Bool { alpha < 0.005 }
+
+        func opacity(_ alpha: Double) -> Shade {
+            Shade(red: red, green: green, blue: blue, alpha: alpha)
+        }
+    }
+
+    /// Which outline a `.shape` mark draws. The closed figures fill their box;
+    /// the open ones — line and arrow — run end to end and keep their two ends
+    /// in `points`, because a box alone loses which diagonal was drawn.
+    enum Figure: String, Codable, CaseIterable, Identifiable {
+        case rectangle, ellipse, triangle, diamond, star, line, arrow
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .rectangle: return "Rectangle"
+            case .ellipse: return "Ellipse"
+            case .triangle: return "Triangle"
+            case .diamond: return "Diamond"
+            case .star: return "Star"
+            case .line: return "Line"
+            case .arrow: return "Arrow"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .rectangle: return "rectangle"
+            case .ellipse: return "circle"
+            case .triangle: return "triangle"
+            case .diamond: return "diamond"
+            case .star: return "star"
+            case .line: return "line.diagonal"
+            case .arrow: return "line.diagonal.arrow"
+            }
+        }
+
+        /// Open figures are a stroke between two ends, not an outlined box.
+        var isOpen: Bool { self == .line || self == .arrow }
     }
 
     var id = UUID()
@@ -140,6 +180,8 @@ struct Annotation: Identifiable, Codable, Hashable {
     var lineWidth: Double = 2
     var cornerRadius: Double = 4
     var fontSize: Double = 12
+    /// Which figure a `.shape` draws. Ignored by every other kind.
+    var figure: Figure = .rectangle
 
     /// Colour actually drawn for the outline, falling back to the preset ink.
     var strokeShade: Shade { stroke ?? ink.shade }
@@ -160,13 +202,13 @@ struct Annotation: Identifiable, Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, ink, page, rect, bands, points, text
-        case stroke, fill, fillInk, filled, lineWidth, cornerRadius, fontSize
+        case stroke, fill, fillInk, filled, lineWidth, cornerRadius, fontSize, figure
     }
 
     init(id: UUID = UUID(), kind: Kind, ink: Ink = .yellow, page: Int, rect: CGRect,
          bands: [CGRect] = [], points: [CGPoint] = [], text: String = "",
          stroke: Shade? = nil, fill: Shade? = nil, lineWidth: Double = 2,
-         cornerRadius: Double = 4, fontSize: Double = 12) {
+         cornerRadius: Double = 4, fontSize: Double = 12, figure: Figure = .rectangle) {
         self.id = id
         self.kind = kind
         self.ink = ink
@@ -180,6 +222,7 @@ struct Annotation: Identifiable, Codable, Hashable {
         self.lineWidth = lineWidth
         self.cornerRadius = cornerRadius
         self.fontSize = fontSize
+        self.figure = figure
     }
 
     // Lenient, so marks saved before the styling fields existed still decode.
@@ -208,6 +251,8 @@ struct Annotation: Identifiable, Codable, Hashable {
         lineWidth = try box.decodeIfPresent(Double.self, forKey: .lineWidth) ?? 2
         cornerRadius = try box.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 4
         fontSize = try box.decodeIfPresent(Double.self, forKey: .fontSize) ?? 12
+        // Every shape drawn before there was a choice was a rectangle.
+        figure = try box.decodeIfPresent(Figure.self, forKey: .figure) ?? .rectangle
     }
 
     func encode(to encoder: Encoder) throws {
@@ -225,6 +270,7 @@ struct Annotation: Identifiable, Codable, Hashable {
         try box.encode(lineWidth, forKey: .lineWidth)
         try box.encode(cornerRadius, forKey: .cornerRadius)
         try box.encode(fontSize, forKey: .fontSize)
+        try box.encode(figure, forKey: .figure)
     }
 }
 
